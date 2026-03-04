@@ -22,6 +22,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression/function/aggregation"
 	"github.com/dolthub/go-mysql-server/sql/hash"
+	"github.com/dolthub/go-mysql-server/sql/plan"
 )
 
 type groupByIter struct {
@@ -326,4 +327,225 @@ func evalBuffers(
 	}
 
 	return row, nil
+}
+
+// buildPartitionAggregation builds the row iterator for PartitionAggregation nodes.
+// It reads pre-aggregated results from each partition and merges them.
+func (b *BaseBuilder) buildPartitionAggregation(ctx *sql.Context, n *plan.PartitionAggregation, row sql.Row) (sql.RowIter, error) {
+	span, ctx := ctx.Span("plan.PartitionAggregation")
+	defer span.End()
+
+	childIter, err := b.buildNodeExec(ctx, n.Child, row)
+	if err != nil {
+		return nil, err
+	}
+
+	return &partitionAggregationIter{
+		child: childIter,
+		aggs:  n.Aggregations,
+	}, nil
+}
+
+// partitionAggregationIter merges partition-level aggregation results.
+type partitionAggregationIter struct {
+	child sql.RowIter
+	aggs  []sql.ColumnAggregation
+	done  bool
+}
+
+func (i *partitionAggregationIter) Next(ctx *sql.Context) (sql.Row, error) {
+	if i.done {
+		return nil, io.EOF
+	}
+	i.done = true
+
+	// Initialize merged results - SUM will be initialized on first value to preserve type
+	merged := make([]interface{}, len(i.aggs))
+	for j, agg := range i.aggs {
+		switch agg.Type {
+		case sql.AggregationTypeCount:
+			merged[j] = int64(0)
+		case sql.AggregationTypeSum:
+			// Leave nil - will be initialized with correct type on first value
+			merged[j] = nil
+		case sql.AggregationTypeMin, sql.AggregationTypeMax:
+			merged[j] = nil
+		}
+	}
+
+	// Read all partition results and merge
+	for {
+		row, err := i.child.Next(ctx)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+
+		// Merge each aggregation value
+		for j, agg := range i.aggs {
+			if j >= len(row) {
+				continue
+			}
+
+			val := row[j]
+			if val == nil {
+				continue
+			}
+
+			switch agg.Type {
+			case sql.AggregationTypeCount:
+				// Sum up counts
+				if count, ok := aggToInt64(val); ok {
+					merged[j] = merged[j].(int64) + count
+				}
+
+			case sql.AggregationTypeSum:
+				// Sum up sums - preserve int64 or float64 based on partition value type
+				if merged[j] == nil {
+					// First value - initialize with same type
+					switch v := val.(type) {
+					case int64:
+						merged[j] = v
+					case float64:
+						merged[j] = v
+					default:
+						// Fallback to float64 for other numeric types
+						if f, ok := aggToFloat64(val); ok {
+							merged[j] = f
+						}
+					}
+				} else {
+					// Subsequent values - accumulate with matching type
+					switch current := merged[j].(type) {
+					case int64:
+						if v, ok := val.(int64); ok {
+							merged[j] = current + v
+						}
+					case float64:
+						if f, ok := aggToFloat64(val); ok {
+							merged[j] = current + f
+						}
+					}
+				}
+
+			case sql.AggregationTypeMin:
+				// Take minimum
+				if merged[j] == nil {
+					merged[j] = val
+				} else if aggCompareValues(val, merged[j]) < 0 {
+					merged[j] = val
+				}
+
+			case sql.AggregationTypeMax:
+				// Take maximum
+				if merged[j] == nil {
+					merged[j] = val
+				} else if aggCompareValues(val, merged[j]) > 0 {
+					merged[j] = val
+				}
+			}
+		}
+	}
+
+	return sql.Row(merged), nil
+}
+
+func (i *partitionAggregationIter) Close(ctx *sql.Context) error {
+	return i.child.Close(ctx)
+}
+
+// aggToInt64 converts a value to int64 if possible.
+func aggToInt64(val interface{}) (int64, bool) {
+	switch v := val.(type) {
+	case int:
+		return int64(v), true
+	case int8:
+		return int64(v), true
+	case int16:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case uint:
+		return int64(v), true
+	case uint8:
+		return int64(v), true
+	case uint16:
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint64:
+		return int64(v), true
+	case float32:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+// aggToFloat64 converts a value to float64 if possible.
+func aggToFloat64(val interface{}) (float64, bool) {
+	switch v := val.(type) {
+	case int:
+		return float64(v), true
+	case int8:
+		return float64(v), true
+	case int16:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint:
+		return float64(v), true
+	case uint8:
+		return float64(v), true
+	case uint16:
+		return float64(v), true
+	case uint32:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+// aggCompareValues compares two values, returning -1, 0, or 1.
+func aggCompareValues(a, b interface{}) int {
+	// Handle numeric comparisons
+	if af, aok := aggToFloat64(a); aok {
+		if bf, bok := aggToFloat64(b); bok {
+			if af < bf {
+				return -1
+			} else if af > bf {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Handle string comparisons
+	if as, ok := a.(string); ok {
+		if bs, ok := b.(string); ok {
+			if as < bs {
+				return -1
+			} else if as > bs {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Fallback: treat as equal if we can't compare
+	return 0
 }

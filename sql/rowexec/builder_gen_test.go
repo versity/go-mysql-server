@@ -116,6 +116,7 @@ func TestGenBuilder(t *testing.T) {
 		"nothing":                   "plan.nothing",
 		"Offset":                    "*plan.Offset",
 		"Open":                      "*plan.Open",
+		"PartitionAggregation":      "*plan.PartitionAggregation",
 		"PrepareQuery":              "*plan.PrepareQuery",
 		"ExecuteQuery":              "*plan.ExecuteQuery",
 		"DeallocateQuery":           "*plan.DeallocateQuery",

@@ -121,6 +121,45 @@ type ProjectedTable interface {
 	Projections() []string
 }
 
+// AggregationType represents the type of aggregation that can be pushed down to partitions.
+type AggregationType int
+
+const (
+	// AggregationTypeCount represents COUNT aggregation
+	AggregationTypeCount AggregationType = iota
+	// AggregationTypeSum represents SUM aggregation
+	AggregationTypeSum
+	// AggregationTypeMin represents MIN aggregation
+	AggregationTypeMin
+	// AggregationTypeMax represents MAX aggregation
+	AggregationTypeMax
+)
+
+// ColumnAggregation describes an aggregation to be computed for a column.
+type ColumnAggregation struct {
+	// Type is the type of aggregation (COUNT, SUM, MIN, MAX)
+	Type AggregationType
+	// ColumnIndex is the index of the column to aggregate (-1 for COUNT(*))
+	ColumnIndex int
+	// ColumnName is the name of the column being aggregated
+	ColumnName string
+}
+
+// AggregableTable is a table that can compute aggregations (COUNT, SUM, MIN, MAX),
+// avoiding the need to return all rows for aggregation by the query engine.
+type AggregableTable interface {
+	Table
+	// CanAggregate returns true if all of the given aggregations can be computed
+	// without GROUP BY.
+	CanAggregate(ctx *Context, aggs []ColumnAggregation) bool
+	// WithAggregates returns a table configured to compute the given aggregations.
+	// The returned table's PartitionRows should return a single row
+	// per partition with the aggregated values.
+	WithAggregates(ctx *Context, aggs []ColumnAggregation) Table
+	// Aggregates returns the aggregations configured for this table, or nil if none.
+	Aggregates() []ColumnAggregation
+}
+
 // IndexAddressable is a table that can be scanned through a primary index
 type IndexAddressable interface {
 	// IndexedAccess returns a table that can perform scans constrained to

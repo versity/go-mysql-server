@@ -58,6 +58,7 @@ const (
 	eraseProjectionId            // eraseProjection
 	flattenDistinctId            // flattenDistinct
 	replaceAggId                 // replaceAgg
+	pushdownAggregationsId       // pushdownAggregations
 	replaceIdxSortId             // replaceIdxSort
 	insertTopNId                 // insertTopNNodes
 	replaceIdxOrderByDistanceId  // replaceIdxOrderByDistance
