@@ -170,6 +170,18 @@ func extractCountAggregation(count *aggregation.Count, schema sql.Schema, alias 
 				ColumnName:  "",
 			}, alias, true
 		}
+		// Handle quoted column names that come through as string literals
+		if colName, ok := lit.Value().(string); ok {
+			colIdx := findColumnIndexByName(schema, colName)
+			if colIdx < 0 {
+				return sql.ColumnAggregation{}, "", false
+			}
+			return sql.ColumnAggregation{
+				Type:        sql.AggregationTypeCount,
+				ColumnIndex: colIdx,
+				ColumnName:  colName,
+			}, alias, true
+		}
 	}
 
 	// COUNT(column)
@@ -192,13 +204,23 @@ func extractCountAggregation(count *aggregation.Count, schema sql.Schema, alias 
 
 // extractColumnAggregation handles SUM, MIN, MAX on columns.
 func extractColumnAggregation(child sql.Expression, aggType sql.AggregationType, schema sql.Schema, alias string) (sql.ColumnAggregation, string, bool) {
-	gf, ok := child.(*expression.GetField)
-	if !ok {
+	var colName string
+
+	switch c := child.(type) {
+	case *expression.GetField:
+		colName = c.Name()
+	case *expression.Literal:
+		// Handle quoted column names that come through as string literals
+		s, ok := c.Value().(string)
+		if !ok {
+			return sql.ColumnAggregation{}, "", false
+		}
+		colName = s
+	default:
 		return sql.ColumnAggregation{}, "", false
 	}
 
 	// Find the column index in the table schema by name
-	colName := gf.Name()
 	colIdx := findColumnIndexByName(schema, colName)
 	if colIdx < 0 {
 		return sql.ColumnAggregation{}, "", false
