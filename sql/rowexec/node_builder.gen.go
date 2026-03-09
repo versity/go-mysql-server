@@ -84,6 +84,8 @@ func (b *BaseBuilder) buildNodeExecNoAnalyze(ctx *sql.Context, n sql.Node, row s
 		return b.buildTableCount(ctx, n, row)
 	case *plan.PartitionAggregation:
 		return b.buildPartitionAggregation(ctx, n, row)
+	case *plan.PartitionGroupedAggregation:
+		return b.buildPartitionGroupedAggregation(ctx, n, row)
 	case *plan.ShowCreateTable:
 		return b.buildShowCreateTable(ctx, n, row)
 	case *plan.ShowIndexes:

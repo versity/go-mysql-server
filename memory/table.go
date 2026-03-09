@@ -58,6 +58,9 @@ type Table struct {
 
 	// aggregates is the list of aggregations to compute at the partition level
 	aggregates []sql.ColumnAggregation
+
+	// groupByCols is the list of GROUP BY columns for grouped aggregation pushdown
+	groupByCols []sql.GroupByColumn
 }
 
 var _ sql.Table = (*Table)(nil)
@@ -523,7 +526,12 @@ func (i *indexScanRowIter) Close(context *sql.Context) error {
 func (t *Table) PartitionRows(ctx *sql.Context, partition sql.Partition) (sql.RowIter, error) {
 	data := t.sessionTableData(ctx)
 
-	// If aggregates are configured, compute them instead of returning rows
+	// If grouped aggregates are configured, compute them by group
+	if len(t.aggregates) > 0 && len(t.groupByCols) > 0 {
+		return t.computeGroupedAggregates(ctx, partition, data)
+	}
+
+	// If ungrouped aggregates are configured, compute them instead of returning rows
 	if len(t.aggregates) > 0 {
 		return t.computeAggregates(ctx, partition, data)
 	}
@@ -1824,6 +1832,209 @@ func (t *Table) WithAggregates(ctx *sql.Context, aggs []sql.ColumnAggregation) s
 // Aggregates implements sql.AggregableTable
 func (t *Table) Aggregates() []sql.ColumnAggregation {
 	return t.aggregates
+}
+
+// CanGroupedAggregate implements sql.AggregableTable
+func (t *Table) CanGroupedAggregate(ctx *sql.Context, aggs []sql.ColumnAggregation, groupByCols []sql.GroupByColumn) bool {
+	for _, agg := range aggs {
+		switch agg.Type {
+		case sql.AggregationTypeCount, sql.AggregationTypeSum, sql.AggregationTypeMin, sql.AggregationTypeMax, sql.AggregationTypeAvg:
+			// supported
+		default:
+			return false
+		}
+	}
+	return len(groupByCols) > 0
+}
+
+// WithGroupedAggregates implements sql.AggregableTable
+func (t *Table) WithGroupedAggregates(ctx *sql.Context, aggs []sql.ColumnAggregation, groupByCols []sql.GroupByColumn) sql.Table {
+	nt := *t
+	nt.aggregates = aggs
+	nt.groupByCols = groupByCols
+	return &nt
+}
+
+// GroupByColumns implements sql.AggregableTable
+func (t *Table) GroupByColumns() []sql.GroupByColumn {
+	return t.groupByCols
+}
+
+// computeGroupedAggregates computes grouped aggregations for a single partition.
+// Returns multiple rows (one per group within this partition).
+// Row layout: [groupByCol1, ..., groupByColN, agg1, agg2, ...]
+// For AggregationTypeAvg, two values are returned: (partialSum, partialCount).
+func (t *Table) computeGroupedAggregates(ctx *sql.Context, partition sql.Partition, data *TableData) (sql.RowIter, error) {
+	rows, ok := data.partitions[string(partition.Key())]
+	if !ok {
+		return nil, sql.ErrPartitionNotFound.New(partition.Key())
+	}
+
+	// If partition is empty, return no rows
+	if len(rows) == 0 {
+		return sql.RowsToRowIter(), nil
+	}
+
+	// Resolve group-by column indices in the full schema
+	gbIndices := make([]int, len(t.groupByCols))
+	for i, gc := range t.groupByCols {
+		found := false
+		for j, col := range data.schema.Schema {
+			if col.Name == gc.ColumnName {
+				gbIndices[i] = j
+				found = true
+				break
+			}
+		}
+		if !found {
+			gbIndices[i] = gc.ColumnIndex
+		}
+	}
+
+	// Resolve aggregation column indices
+	aggColIndices := make([]int, len(t.aggregates))
+	for i, agg := range t.aggregates {
+		if agg.ColumnIndex < 0 {
+			aggColIndices[i] = -1 // COUNT(*)
+		} else if agg.ColumnName != "" {
+			found := false
+			for j, col := range data.schema.Schema {
+				if col.Name == agg.ColumnName {
+					aggColIndices[i] = j
+					found = true
+					break
+				}
+			}
+			if !found {
+				aggColIndices[i] = agg.ColumnIndex
+			}
+		} else {
+			aggColIndices[i] = agg.ColumnIndex
+		}
+	}
+
+	// Calculate the number of agg slots per output row
+	aggSlots := 0
+	for _, agg := range t.aggregates {
+		if agg.Type == sql.AggregationTypeAvg {
+			aggSlots += 2
+		} else {
+			aggSlots++
+		}
+	}
+
+	// Group rows by group-by column values
+	type groupData struct {
+		key     sql.Row       // group-by column values
+		aggVals []interface{} // aggregation accumulator slots
+	}
+	var groupOrder []string
+	groups := make(map[string]*groupData)
+
+	for _, row := range rows {
+		// Build group key
+		keyParts := make([]string, len(gbIndices))
+		keyVals := make(sql.Row, len(gbIndices))
+		for i, idx := range gbIndices {
+			if idx >= 0 && idx < len(row) {
+				keyVals[i] = row[idx]
+				keyParts[i] = fmt.Sprintf("%v", row[idx])
+			}
+		}
+		var keyStr string
+		if len(keyParts) == 1 {
+			keyStr = keyParts[0]
+		} else {
+			keyStr = strings.Join(keyParts, "\x00")
+		}
+
+		gd, exists := groups[keyStr]
+		if !exists {
+			vals := make([]interface{}, aggSlots)
+			slotIdx := 0
+			for _, agg := range t.aggregates {
+				switch agg.Type {
+				case sql.AggregationTypeCount:
+					vals[slotIdx] = int64(0)
+				case sql.AggregationTypeSum:
+					vals[slotIdx] = float64(0)
+				case sql.AggregationTypeAvg:
+					vals[slotIdx] = float64(0) // partial sum
+					vals[slotIdx+1] = int64(0) // partial count
+				case sql.AggregationTypeMin, sql.AggregationTypeMax:
+					vals[slotIdx] = nil
+				}
+				if agg.Type == sql.AggregationTypeAvg {
+					slotIdx += 2
+				} else {
+					slotIdx++
+				}
+			}
+			gd = &groupData{key: keyVals, aggVals: vals}
+			groups[keyStr] = gd
+			groupOrder = append(groupOrder, keyStr)
+		}
+
+		// Accumulate aggregation values
+		slotIdx := 0
+		for i, agg := range t.aggregates {
+			colIdx := aggColIndices[i]
+			switch agg.Type {
+			case sql.AggregationTypeCount:
+				if colIdx < 0 {
+					gd.aggVals[slotIdx] = gd.aggVals[slotIdx].(int64) + 1
+				} else if colIdx < len(row) && row[colIdx] != nil {
+					gd.aggVals[slotIdx] = gd.aggVals[slotIdx].(int64) + 1
+				}
+			case sql.AggregationTypeSum:
+				if colIdx >= 0 && colIdx < len(row) && row[colIdx] != nil {
+					if f, ok := t.toFloat64(row[colIdx]); ok {
+						gd.aggVals[slotIdx] = gd.aggVals[slotIdx].(float64) + f
+					}
+				}
+			case sql.AggregationTypeAvg:
+				if colIdx >= 0 && colIdx < len(row) && row[colIdx] != nil {
+					if f, ok := t.toFloat64(row[colIdx]); ok {
+						gd.aggVals[slotIdx] = gd.aggVals[slotIdx].(float64) + f
+						gd.aggVals[slotIdx+1] = gd.aggVals[slotIdx+1].(int64) + 1
+					}
+				}
+			case sql.AggregationTypeMin:
+				if colIdx >= 0 && colIdx < len(row) && row[colIdx] != nil {
+					if gd.aggVals[slotIdx] == nil {
+						gd.aggVals[slotIdx] = row[colIdx]
+					} else if t.compareValues(row[colIdx], gd.aggVals[slotIdx]) < 0 {
+						gd.aggVals[slotIdx] = row[colIdx]
+					}
+				}
+			case sql.AggregationTypeMax:
+				if colIdx >= 0 && colIdx < len(row) && row[colIdx] != nil {
+					if gd.aggVals[slotIdx] == nil {
+						gd.aggVals[slotIdx] = row[colIdx]
+					} else if t.compareValues(row[colIdx], gd.aggVals[slotIdx]) > 0 {
+						gd.aggVals[slotIdx] = row[colIdx]
+					}
+				}
+			}
+			if agg.Type == sql.AggregationTypeAvg {
+				slotIdx += 2
+			} else {
+				slotIdx++
+			}
+		}
+	}
+
+	// Build result rows
+	resultRows := make([]sql.Row, 0, len(groupOrder))
+	for _, key := range groupOrder {
+		gd := groups[key]
+		outRow := make(sql.Row, len(gbIndices)+aggSlots)
+		copy(outRow, gd.key)
+		copy(outRow[len(gbIndices):], gd.aggVals)
+		resultRows = append(resultRows, outRow)
+	}
+
+	return sql.RowsToRowIter(resultRows...), nil
 }
 
 // computeAggregates computes aggregations for a single partition

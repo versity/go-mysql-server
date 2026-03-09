@@ -206,9 +206,212 @@ func aggregationTypeName(t sql.AggregationType) string {
 		return "MIN"
 	case sql.AggregationTypeMax:
 		return "MAX"
+	case sql.AggregationTypeAvg:
+		return "AVG"
 	default:
 		return "UNKNOWN"
 	}
+}
+
+// PartitionGroupedAggregation is a plan node that represents grouped aggregations
+// pushed down to the table partition level. Each partition returns one row per group
+// with the group-by key columns followed by aggregation results. This node merges
+// partial results across partitions.
+type PartitionGroupedAggregation struct {
+	UnaryNode
+	Aggregations []sql.ColumnAggregation
+	GroupByCols  []sql.GroupByColumn
+	Aliases      []string
+	OriginalAggs []sql.Expression
+	GroupByExprs []sql.Expression
+}
+
+var _ sql.Node = (*PartitionGroupedAggregation)(nil)
+var _ sql.CollationCoercible = (*PartitionGroupedAggregation)(nil)
+
+// NewPartitionGroupedAggregation creates a new PartitionGroupedAggregation node.
+func NewPartitionGroupedAggregation(
+	child *ResolvedTable,
+	aggs []sql.ColumnAggregation,
+	groupByCols []sql.GroupByColumn,
+	aliases []string,
+	originalAggs []sql.Expression,
+	groupByExprs []sql.Expression,
+) *PartitionGroupedAggregation {
+	return &PartitionGroupedAggregation{
+		UnaryNode:    UnaryNode{Child: child},
+		Aggregations: aggs,
+		GroupByCols:  groupByCols,
+		Aliases:      aliases,
+		OriginalAggs: originalAggs,
+		GroupByExprs: groupByExprs,
+	}
+}
+
+// Resolved implements sql.Node.
+func (p *PartitionGroupedAggregation) Resolved() bool {
+	return p.Child.Resolved()
+}
+
+// IsReadOnly implements sql.Node.
+func (p *PartitionGroupedAggregation) IsReadOnly() bool {
+	return true
+}
+
+// partitionRowWidth returns the number of columns each partition row will have.
+// The layout is: [groupByCol1, groupByCol2, ..., agg1, agg2, ...].
+// For AVG aggregations, the partition returns two columns (partialSum, partialCount).
+func (p *PartitionGroupedAggregation) partitionRowWidth() int {
+	width := len(p.GroupByCols)
+	for _, agg := range p.Aggregations {
+		if agg.Type == sql.AggregationTypeAvg {
+			width += 2 // partialSum + partialCount
+		} else {
+			width += 1
+		}
+	}
+	return width
+}
+
+// Schema implements sql.Node.
+// The output schema is the aliases in order. The first entries correspond to
+// GROUP BY columns, followed by aggregation result columns.
+func (p *PartitionGroupedAggregation) Schema() sql.Schema {
+	schema := make(sql.Schema, len(p.Aliases))
+	for i, alias := range p.Aliases {
+		schema[i] = &sql.Column{
+			Name:     alias,
+			Type:     p.typeForOutputColumn(i),
+			Nullable: true,
+		}
+	}
+	return schema
+}
+
+// typeForOutputColumn determines the type for an output column at index i.
+func (p *PartitionGroupedAggregation) typeForOutputColumn(i int) sql.Type {
+	numGroupBy := len(p.GroupByCols)
+	if i < numGroupBy {
+		// Group-by column: get type from child table schema
+		if rt, ok := p.Child.(*ResolvedTable); ok {
+			colName := p.GroupByCols[i].ColumnName
+			for _, col := range rt.Schema() {
+				if col.Name == colName {
+					return col.Type
+				}
+			}
+		}
+		return types.Int64 // fallback
+	}
+
+	// Aggregation column
+	aggIdx := i - numGroupBy
+	if aggIdx >= len(p.Aggregations) {
+		return types.Float64
+	}
+	agg := p.Aggregations[aggIdx]
+	switch agg.Type {
+	case sql.AggregationTypeCount:
+		return types.Int64
+	case sql.AggregationTypeSum:
+		return types.Float64
+	case sql.AggregationTypeAvg:
+		return types.Float64
+	case sql.AggregationTypeMin, sql.AggregationTypeMax:
+		if rt, ok := p.Child.(*ResolvedTable); ok {
+			for _, col := range rt.Schema() {
+				if col.Name == agg.ColumnName {
+					return col.Type
+				}
+			}
+		}
+		return types.Float64
+	default:
+		return types.Float64
+	}
+}
+
+// WithChildren implements sql.Node.
+func (p *PartitionGroupedAggregation) WithChildren(children ...sql.Node) (sql.Node, error) {
+	if len(children) != 1 {
+		return nil, sql.ErrInvalidChildrenNumber.New(p, len(children), 1)
+	}
+	return &PartitionGroupedAggregation{
+		UnaryNode:    UnaryNode{Child: children[0]},
+		Aggregations: p.Aggregations,
+		GroupByCols:  p.GroupByCols,
+		Aliases:      p.Aliases,
+		OriginalAggs: p.OriginalAggs,
+		GroupByExprs: p.GroupByExprs,
+	}, nil
+}
+
+// CollationCoercibility implements sql.CollationCoercible.
+func (p *PartitionGroupedAggregation) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
+	return sql.GetCoercibility(ctx, p.Child)
+}
+
+// String implements sql.Node.
+func (p *PartitionGroupedAggregation) String() string {
+	pr := sql.NewTreePrinter()
+	_ = pr.WriteNode("PartitionGroupedAggregation")
+
+	var groupStrs []string
+	for _, gc := range p.GroupByCols {
+		groupStrs = append(groupStrs, gc.ColumnName)
+	}
+
+	var aggStrs []string
+	for i, agg := range p.Aggregations {
+		aliasIdx := len(p.GroupByCols) + i
+		alias := ""
+		if aliasIdx < len(p.Aliases) {
+			alias = p.Aliases[aliasIdx]
+		}
+		aggStrs = append(aggStrs, fmt.Sprintf("%s(%s) AS %s",
+			aggregationTypeName(agg.Type),
+			agg.ColumnName,
+			alias))
+	}
+
+	_ = pr.WriteChildren(
+		fmt.Sprintf("GroupBy(%s)", strings.Join(groupStrs, ", ")),
+		fmt.Sprintf("Aggregations(%s)", strings.Join(aggStrs, ", ")),
+		p.Child.String(),
+	)
+	return pr.String()
+}
+
+// DebugString implements sql.Node.
+func (p *PartitionGroupedAggregation) DebugString() string {
+	pr := sql.NewTreePrinter()
+	_ = pr.WriteNode("PartitionGroupedAggregation")
+
+	var groupStrs []string
+	for _, gc := range p.GroupByCols {
+		groupStrs = append(groupStrs, fmt.Sprintf("%s(col[%d])", gc.ColumnName, gc.ColumnIndex))
+	}
+
+	var aggStrs []string
+	for i, agg := range p.Aggregations {
+		aliasIdx := len(p.GroupByCols) + i
+		alias := ""
+		if aliasIdx < len(p.Aliases) {
+			alias = p.Aliases[aliasIdx]
+		}
+		aggStrs = append(aggStrs, fmt.Sprintf("%s(col[%d]:%s) AS %s",
+			aggregationTypeName(agg.Type),
+			agg.ColumnIndex,
+			agg.ColumnName,
+			alias))
+	}
+
+	_ = pr.WriteChildren(
+		fmt.Sprintf("GroupBy(%s)", strings.Join(groupStrs, ", ")),
+		fmt.Sprintf("Aggregations(%s)", strings.Join(aggStrs, ", ")),
+		sql.DebugString(p.Child),
+	)
+	return pr.String()
 }
 
 // GetAggregations returns the partition aggregations.

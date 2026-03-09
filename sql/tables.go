@@ -133,11 +133,13 @@ const (
 	AggregationTypeMin
 	// AggregationTypeMax represents MAX aggregation
 	AggregationTypeMax
+	// AggregationTypeAvg represents AVG aggregation (pushed as SUM+COUNT pair)
+	AggregationTypeAvg
 )
 
 // ColumnAggregation describes an aggregation to be computed for a column.
 type ColumnAggregation struct {
-	// Type is the type of aggregation (COUNT, SUM, MIN, MAX)
+	// Type is the type of aggregation (COUNT, SUM, MIN, MAX, AVG)
 	Type AggregationType
 	// ColumnIndex is the index of the column to aggregate (-1 for COUNT(*))
 	ColumnIndex int
@@ -145,7 +147,15 @@ type ColumnAggregation struct {
 	ColumnName string
 }
 
-// AggregableTable is a table that can compute aggregations (COUNT, SUM, MIN, MAX),
+// GroupByColumn describes a column used in a GROUP BY clause for aggregation pushdown.
+type GroupByColumn struct {
+	// ColumnName is the name of the column to group by
+	ColumnName string
+	// ColumnIndex is the index of the column in the table schema
+	ColumnIndex int
+}
+
+// AggregableTable is a table that can compute aggregations (COUNT, SUM, MIN, MAX, AVG),
 // avoiding the need to return all rows for aggregation by the query engine.
 type AggregableTable interface {
 	Table
@@ -158,6 +168,17 @@ type AggregableTable interface {
 	WithAggregates(ctx *Context, aggs []ColumnAggregation) Table
 	// Aggregates returns the aggregations configured for this table, or nil if none.
 	Aggregates() []ColumnAggregation
+
+	// CanGroupedAggregate returns true if the given aggregations can be computed
+	// with the given GROUP BY columns pushed down to partition level.
+	CanGroupedAggregate(ctx *Context, aggs []ColumnAggregation, groupByCols []GroupByColumn) bool
+	// WithGroupedAggregates returns a table configured to compute grouped aggregations.
+	// The returned table's PartitionRows should return one row per group per partition,
+	// with the group-by column values followed by the aggregated values.
+	// For AggregationTypeAvg, the table should return two values (partialSum, partialCount).
+	WithGroupedAggregates(ctx *Context, aggs []ColumnAggregation, groupByCols []GroupByColumn) Table
+	// GroupByColumns returns the GROUP BY columns configured for this table, or nil.
+	GroupByColumns() []GroupByColumn
 }
 
 // IndexAddressable is a table that can be scanned through a primary index

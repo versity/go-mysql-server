@@ -48,11 +48,6 @@ func pushdownAggregations(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan
 			return node, transform.SameTree, nil
 		}
 
-		// Only handle ungrouped aggregations (no GROUP BY expressions)
-		if len(groupBy.GroupByExprs) > 0 {
-			return node, transform.SameTree, nil
-		}
-
 		// Check if child is a table we can push down to
 		rt, ok := getResolvedTableForAgg(groupBy.Child)
 		if !ok {
@@ -64,6 +59,13 @@ func pushdownAggregations(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan
 		if !ok {
 			return node, transform.SameTree, nil
 		}
+
+		// Dispatch to grouped or ungrouped pushdown
+		if len(groupBy.GroupByExprs) > 0 {
+			return pushdownGroupedAggregation(ctx, a, groupBy, rt, aggTable)
+		}
+
+		// Ungrouped aggregation pushdown (existing behavior)
 
 		// Extract pushable aggregations from selected expressions
 		aggs, aliases, ok := extractPushableAggregations(groupBy.SelectDeps, rt.Table.Schema())
@@ -94,6 +96,162 @@ func pushdownAggregations(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan
 		a.Log("aggregations pushed down to table %s", rt.Name())
 		return partAgg, transform.NewTree, nil
 	})
+}
+
+// pushdownGroupedAggregation handles aggregation pushdown for queries with GROUP BY.
+// Only supports GROUP BY on simple column references (not expressions).
+func pushdownGroupedAggregation(
+	ctx *sql.Context,
+	a *Analyzer,
+	groupBy *plan.GroupBy,
+	rt *plan.ResolvedTable,
+	aggTable sql.AggregableTable,
+) (sql.Node, transform.TreeIdentity, error) {
+	schema := rt.Table.Schema()
+
+	// Extract GROUP BY columns - only support simple column references
+	groupByCols, ok := extractGroupByColumns(groupBy.GroupByExprs, schema)
+	if !ok || len(groupByCols) == 0 {
+		return groupBy, transform.SameTree, nil
+	}
+
+	// Classify each SelectDep as either a group-by column passthrough or an aggregation
+	aggs, aliases, ok := extractGroupedPushableExpressions(groupBy.SelectDeps, groupBy.GroupByExprs, schema)
+	if !ok {
+		return groupBy, transform.SameTree, nil
+	}
+
+	// Check if table can handle these grouped aggregations
+	if !aggTable.CanGroupedAggregate(ctx, aggs, groupByCols) {
+		return groupBy, transform.SameTree, nil
+	}
+
+	// Create new table with grouped aggregation pushdown
+	newTable := aggTable.WithGroupedAggregates(ctx, aggs, groupByCols)
+	newRT, err := rt.WithTable(newTable)
+	if err != nil {
+		return groupBy, transform.SameTree, nil
+	}
+
+	// Create partition grouped aggregation node
+	partAgg := plan.NewPartitionGroupedAggregation(
+		newRT.(*plan.ResolvedTable),
+		aggs,
+		groupByCols,
+		aliases,
+		groupBy.SelectDeps,
+		groupBy.GroupByExprs,
+	)
+
+	a.Log("grouped aggregations pushed down to table %s", rt.Name())
+	return partAgg, transform.NewTree, nil
+}
+
+// extractGroupByColumns extracts GroupByColumn descriptors from GROUP BY expressions.
+// Returns false if any expression is not a simple column reference.
+func extractGroupByColumns(exprs []sql.Expression, schema sql.Schema) ([]sql.GroupByColumn, bool) {
+	cols := make([]sql.GroupByColumn, 0, len(exprs))
+	for _, expr := range exprs {
+		gf, ok := expr.(*expression.GetField)
+		if !ok {
+			return nil, false
+		}
+		colName := gf.Name()
+		colIdx := findColumnIndexByName(schema, colName)
+		if colIdx < 0 {
+			return nil, false
+		}
+		cols = append(cols, sql.GroupByColumn{
+			ColumnName:  colName,
+			ColumnIndex: colIdx,
+		})
+	}
+	return cols, true
+}
+
+// extractGroupedPushableExpressions analyzes the SELECT expressions in a GROUP BY query
+// and returns ColumnAggregation descriptors for the aggregation expressions, plus aliases
+// for all output columns (group-by columns first, then aggregations).
+// Returns false if any expression cannot be pushed down.
+func extractGroupedPushableExpressions(
+	selectDeps []sql.Expression,
+	groupByExprs []sql.Expression,
+	schema sql.Schema,
+) ([]sql.ColumnAggregation, []string, bool) {
+	// Build a set of GROUP BY column names for matching
+	groupByColNames := make(map[string]bool, len(groupByExprs))
+	for _, gbe := range groupByExprs {
+		if gf, ok := gbe.(*expression.GetField); ok {
+			groupByColNames[gf.Name()] = true
+		}
+	}
+
+	// Separate select expressions into group-by column refs and aggregation functions
+	aggs := make([]sql.ColumnAggregation, 0)
+	// Aliases: group-by column names first (in the order they appear in groupByExprs),
+	// then aggregation aliases
+	aliases := make([]string, 0, len(selectDeps))
+
+	// First, add aliases for group-by columns in their canonical order
+	for _, gbe := range groupByExprs {
+		if gf, ok := gbe.(*expression.GetField); ok {
+			aliases = append(aliases, gf.Name())
+		}
+	}
+
+	for _, expr := range selectDeps {
+		// Unwrap alias
+		var innerExpr sql.Expression
+		alias := ""
+		if a, ok := expr.(*expression.Alias); ok {
+			alias = a.Name()
+			innerExpr = a.Child
+		} else {
+			alias = expr.String()
+			innerExpr = expr
+		}
+
+		// Check if this is a reference to a GROUP BY column
+		if gf, ok := innerExpr.(*expression.GetField); ok {
+			if groupByColNames[gf.Name()] {
+				// This is a group-by column passthrough - already in aliases from above
+				continue
+			}
+		}
+
+		// Must be an aggregation function
+		agg, _, ok := extractSingleGroupedAggregation(innerExpr, schema, alias)
+		if !ok {
+			return nil, nil, false
+		}
+		aggs = append(aggs, agg)
+		aliases = append(aliases, alias)
+	}
+
+	if len(aggs) == 0 {
+		return nil, nil, false
+	}
+
+	return aggs, aliases, true
+}
+
+// extractSingleGroupedAggregation extracts a single aggregation from a grouped query expression.
+// This extends extractSingleAggregation to also support AVG.
+func extractSingleGroupedAggregation(expr sql.Expression, schema sql.Schema, alias string) (sql.ColumnAggregation, string, bool) {
+	switch agg := expr.(type) {
+	case *aggregation.Count:
+		return extractCountAggregation(agg, schema, alias)
+	case *aggregation.Sum:
+		return extractColumnAggregation(agg.Child, sql.AggregationTypeSum, schema, alias)
+	case *aggregation.Min:
+		return extractColumnAggregation(agg.Child, sql.AggregationTypeMin, schema, alias)
+	case *aggregation.Max:
+		return extractColumnAggregation(agg.Child, sql.AggregationTypeMax, schema, alias)
+	case *aggregation.Avg:
+		return extractColumnAggregation(agg.Child, sql.AggregationTypeAvg, schema, alias)
+	default:
+		return sql.ColumnAggregation{}, "", false
+	}
 }
 
 // getResolvedTableForAgg extracts the ResolvedTable from a node, handling TableAlias wrappers.
@@ -226,8 +384,8 @@ func extractColumnAggregation(child sql.Expression, aggType sql.AggregationType,
 		return sql.ColumnAggregation{}, "", false
 	}
 
-	// For SUM, only support simple numeric types (not DECIMAL which requires precision)
-	if aggType == sql.AggregationTypeSum {
+	// For SUM and AVG, only support simple numeric types (not DECIMAL which requires precision)
+	if aggType == sql.AggregationTypeSum || aggType == sql.AggregationTypeAvg {
 		colType := schema[colIdx].Type
 		if !isSafeNumericType(colType) {
 			return sql.ColumnAggregation{}, "", false
