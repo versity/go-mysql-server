@@ -15,7 +15,13 @@
 package sql
 
 import (
+	"context"
 	"io"
+	"sync"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/dolthub/go-mysql-server/errguard"
 )
 
 // TableRowIter is an iterator over the partitions in a table.
@@ -155,4 +161,200 @@ func (i *TableRowIter) Close(ctx *Context) error {
 		}
 	}
 	return i.partitions.Close(ctx)
+}
+
+// ConcurrentTableRowIter is an iterator that reads rows from multiple table partitions concurrently
+// using a pool of worker goroutines. Rows from different partitions may be interleaved in non-deterministic
+// order. Workers are started lazily on the first call to Next.
+type ConcurrentTableRowIter struct {
+	table      Table
+	partitions PartitionIter
+	numWorkers int
+
+	// started is true once the worker goroutines have been launched.
+	started bool
+	// rowChan receives rows produced by worker goroutines.
+	rowChan chan Row
+	// eg coordinates worker goroutines; its Wait closes rowChan.
+	eg *errgroup.Group
+	// cancel cancels the derived context shared by workers.
+	cancel context.CancelFunc
+	// closeMu serializes calls to Close.
+	closeMu sync.Mutex
+	// closed prevents double-close.
+	closed bool
+}
+
+var _ RowIter = (*ConcurrentTableRowIter)(nil)
+
+// NewConcurrentTableRowIter returns an iterator that reads rows from the given table's
+// partitions concurrently. numWorkers controls the maximum number of goroutines that will
+// call PartitionRows simultaneously. The actual worker count is capped at the number of
+// partitions available.
+func NewConcurrentTableRowIter(ctx *Context, table Table, partitions PartitionIter, numWorkers int) *ConcurrentTableRowIter {
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	return &ConcurrentTableRowIter{
+		table:      table,
+		partitions: partitions,
+		numWorkers: numWorkers,
+	}
+}
+
+// start drains all partitions, creates workers, and begins reading rows concurrently.
+func (i *ConcurrentTableRowIter) start(ctx *Context) error {
+	// Drain all partitions into a slice.
+	var parts []Partition
+	for {
+		p, err := i.partitions.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			_ = i.partitions.Close(ctx)
+			return err
+		}
+		parts = append(parts, p)
+	}
+	if err := i.partitions.Close(ctx); err != nil {
+		return err
+	}
+
+	if len(parts) == 0 {
+		i.started = true
+		// Make a closed channel so Next returns io.EOF immediately.
+		ch := make(chan Row)
+		close(ch)
+		i.rowChan = ch
+		return nil
+	}
+
+	// Cap workers at partition count.
+	workers := i.numWorkers
+	if workers > len(parts) {
+		workers = len(parts)
+	}
+
+	eg, egCtx := ctx.NewErrgroup()
+	i.eg = eg
+	i.cancel = func() { egCtx.Done() } // placeholder; real cancel comes from errgroup's WithContext
+
+	// To get a proper cancel func we create a cancellable context wrapping the errgroup context.
+	cancelCtx, cancel := context.WithCancel(egCtx.Context)
+	workerCtx := egCtx.WithContext(cancelCtx)
+	i.cancel = cancel
+
+	// Buffered work channel: workers pull partitions from here.
+	workChan := make(chan Partition, len(parts))
+	for _, p := range parts {
+		workChan <- p
+	}
+	close(workChan)
+
+	// Buffered row channel.
+	i.rowChan = make(chan Row, 512)
+
+	// Launch workers.
+	for w := 0; w < workers; w++ {
+		errguard.Go(eg, func() error {
+			for part := range workChan {
+				rowIter, err := i.table.PartitionRows(workerCtx, part)
+				if err != nil {
+					return err
+				}
+				for {
+					select {
+					case <-cancelCtx.Done():
+						_ = rowIter.Close(workerCtx)
+						return cancelCtx.Err()
+					default:
+					}
+
+					row, err := rowIter.Next(workerCtx)
+					if err == io.EOF {
+						if cerr := rowIter.Close(workerCtx); cerr != nil {
+							return cerr
+						}
+						break
+					}
+					if err != nil {
+						_ = rowIter.Close(workerCtx)
+						return err
+					}
+
+					select {
+					case i.rowChan <- row:
+					case <-cancelCtx.Done():
+						_ = rowIter.Close(workerCtx)
+						return cancelCtx.Err()
+					}
+				}
+			}
+			return nil
+		})
+	}
+
+	// Closer goroutine: waits for all workers then closes rowChan.
+	go func() {
+		_ = eg.Wait()
+		close(i.rowChan)
+	}()
+
+	i.started = true
+	return nil
+}
+
+func (i *ConcurrentTableRowIter) Next(ctx *Context) (Row, error) {
+	if !i.started {
+		if err := i.start(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case row, ok := <-i.rowChan:
+		if !ok {
+			// Channel closed — either all rows consumed or an error occurred.
+			if i.eg != nil {
+				if err := i.eg.Wait(); err != nil {
+					return nil, err
+				}
+			}
+			return nil, io.EOF
+		}
+		return row, nil
+	}
+}
+
+func (i *ConcurrentTableRowIter) Close(ctx *Context) error {
+	i.closeMu.Lock()
+	defer i.closeMu.Unlock()
+	if i.closed {
+		return nil
+	}
+	i.closed = true
+
+	// Cancel workers.
+	if i.cancel != nil {
+		i.cancel()
+	}
+
+	// Drain the row channel to unblock any workers stuck on send.
+	if i.rowChan != nil {
+		for range i.rowChan {
+		}
+	}
+
+	// Wait for all workers to finish.
+	if i.eg != nil {
+		// Ignore context.Canceled since we just cancelled it.
+		if err := i.eg.Wait(); err != nil && err != context.Canceled {
+			return err
+		}
+	}
+
+	return nil
 }

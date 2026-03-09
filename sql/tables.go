@@ -32,6 +32,17 @@ type Table interface {
 	PartitionRows(*Context, Partition) (RowIter, error)
 }
 
+// ConcurrentTable is a table that supports concurrent partition scanning.
+// Implementations should return a positive NumWorkers only when it is safe
+// to interleave rows from different partitions (i.e., when the storage layer
+// does not guarantee or require a specific partition ordering).
+type ConcurrentTable interface {
+	Table
+	// NumWorkers returns the number of concurrent goroutines to use for
+	// scanning partitions. Returning 0 or 1 disables concurrent scanning.
+	NumWorkers() int
+}
+
 // DatabaseSchemaTable is a table that can return the database schema it belongs to. This interface must be implemented
 // for correct function of some DDL in databases that implement SchemaDatabase.
 type DatabaseSchemaTable interface {
