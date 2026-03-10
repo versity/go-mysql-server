@@ -422,7 +422,7 @@ func (i *partitionAggregationIter) Next(ctx *sql.Context) (sql.Row, error) {
 					// Subsequent values - accumulate with matching type
 					switch current := merged[j].(type) {
 					case int64:
-						if v, ok := val.(int64); ok {
+						if v, ok := aggToInt64(val); ok {
 							merged[j] = current + v
 						}
 					case float64:
