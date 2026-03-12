@@ -719,12 +719,18 @@ func (i *partitionGroupedAggregationIter) computeAll(ctx *sql.Context) error {
 					} else {
 						switch current := mg.aggVals[mergeSlotIdx].(type) {
 						case int64:
-							if v, ok := val.(int64); ok {
+							if v, ok := aggToInt64(val); ok {
 								mg.aggVals[mergeSlotIdx] = current + v
 							}
 						case float64:
 							if f, ok := aggToFloat64(val); ok {
 								mg.aggVals[mergeSlotIdx] = current + f
+							}
+						default:
+							if curf, ok := current.(float64); ok {
+								if f, ok := aggToFloat64(val); ok {
+									mg.aggVals[mergeSlotIdx] = curf + f
+								}
 							}
 						}
 					}
