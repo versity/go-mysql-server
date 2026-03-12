@@ -563,6 +563,7 @@ func (b *BaseBuilder) buildPartitionGroupedAggregation(ctx *sql.Context, n *plan
 		return nil, err
 	}
 
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: creating with %d aggregations and %d group-by columns", len(n.Aggregations), len(n.GroupByCols))
 	return &partitionGroupedAggregationIter{
 		child:       childIter,
 		aggs:        n.Aggregations,
@@ -598,13 +599,17 @@ func (i *partitionGroupedAggregationIter) groupKeyString(row sql.Row) string {
 
 func (i *partitionGroupedAggregationIter) Next(ctx *sql.Context) (sql.Row, error) {
 	if !i.computed {
+		ctx.GetLogger().Debugf("partitionGroupedAggregationIter: first call to Next, computing all groups")
 		if err := i.computeAll(ctx); err != nil {
+			ctx.GetLogger().Debugf("partitionGroupedAggregationIter: computeAll error: %v", err)
 			return nil, err
 		}
 		i.computed = true
+		ctx.GetLogger().Debugf("partitionGroupedAggregationIter: computed %d result groups", len(i.results))
 	}
 
 	if i.pos >= len(i.results) {
+		ctx.GetLogger().Debugf("partitionGroupedAggregationIter: all %d results returned, EOF", len(i.results))
 		return nil, io.EOF
 	}
 	row := i.results[i.pos]
@@ -623,6 +628,7 @@ func aggSlotCount(agg sql.ColumnAggregation) int {
 
 // computeAll reads all partition rows and merges by group key.
 func (i *partitionGroupedAggregationIter) computeAll(ctx *sql.Context) error {
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: computeAll starting with %d aggregations", len(i.aggs))
 	// Calculate expected number of agg slots per partition row
 	aggSlots := 0
 	for _, agg := range i.aggs {
@@ -639,19 +645,24 @@ func (i *partitionGroupedAggregationIter) computeAll(ctx *sql.Context) error {
 	}
 	groups := make(map[string]*mergedGroup)
 
+	rowCount := 0
+	newGroupCount := 0
 	for {
 		row, err := i.child.Next(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
+			ctx.GetLogger().Debugf("partitionGroupedAggregationIter: error reading child row: %v", err)
 			return err
 		}
+		rowCount++
 
 		key := i.groupKeyString(row)
 
 		mg, exists := groups[key]
 		if !exists {
+			newGroupCount++
 			// Initialize new group
 			groupKeyCopy := make(sql.Row, i.numGroupBy)
 			copy(groupKeyCopy, row[:i.numGroupBy])
@@ -760,6 +771,8 @@ func (i *partitionGroupedAggregationIter) computeAll(ctx *sql.Context) error {
 
 	// Build result rows: [groupByCol1, ..., groupByColN, finalAgg1, finalAgg2, ...]
 	// For AVG, compute finalSum / finalCount as a single output value.
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: read %d partition rows into %d groups", rowCount, len(groupOrder))
+
 	i.results = make([]sql.Row, 0, len(groupOrder))
 	for _, key := range groupOrder {
 		mg := groups[key]
@@ -787,9 +800,11 @@ func (i *partitionGroupedAggregationIter) computeAll(ctx *sql.Context) error {
 		i.results = append(i.results, outRow)
 	}
 
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: computeAll finished with %d result rows", len(i.results))
 	return nil
 }
 
 func (i *partitionGroupedAggregationIter) Close(ctx *sql.Context) error {
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: closing (computed=%t, returned %d/%d rows)", i.computed, i.pos, len(i.results))
 	return i.child.Close(ctx)
 }

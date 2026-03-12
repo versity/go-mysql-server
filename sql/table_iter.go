@@ -195,6 +195,7 @@ func NewConcurrentTableRowIter(ctx *Context, table Table, partitions PartitionIt
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+	ctx.GetLogger().Debugf("ConcurrentTableRowIter: creating for table %s with %d workers", table.Name(), numWorkers)
 	return &ConcurrentTableRowIter{
 		table:      table,
 		partitions: partitions,
@@ -204,6 +205,7 @@ func NewConcurrentTableRowIter(ctx *Context, table Table, partitions PartitionIt
 
 // start drains all partitions, creates workers, and begins reading rows concurrently.
 func (i *ConcurrentTableRowIter) start(ctx *Context) error {
+	ctx.GetLogger().Debugf("ConcurrentTableRowIter: starting for table %s", i.table.Name())
 	// Drain all partitions into a slice.
 	var parts []Partition
 	for {
@@ -212,14 +214,18 @@ func (i *ConcurrentTableRowIter) start(ctx *Context) error {
 			break
 		}
 		if err != nil {
+			ctx.GetLogger().Debugf("ConcurrentTableRowIter: error draining partitions for table %s: %v", i.table.Name(), err)
 			_ = i.partitions.Close(ctx)
 			return err
 		}
 		parts = append(parts, p)
 	}
 	if err := i.partitions.Close(ctx); err != nil {
+		ctx.GetLogger().Debugf("ConcurrentTableRowIter: error closing partition iter for table %s: %v", i.table.Name(), err)
 		return err
 	}
+
+	ctx.GetLogger().Debugf("ConcurrentTableRowIter: drained %d partitions for table %s", len(parts), i.table.Name())
 
 	if len(parts) == 0 {
 		i.started = true
@@ -227,6 +233,7 @@ func (i *ConcurrentTableRowIter) start(ctx *Context) error {
 		ch := make(chan Row)
 		close(ch)
 		i.rowChan = ch
+		ctx.GetLogger().Debugf("ConcurrentTableRowIter: zero partitions for table %s, returning immediately", i.table.Name())
 		return nil
 	}
 
@@ -256,11 +263,16 @@ func (i *ConcurrentTableRowIter) start(ctx *Context) error {
 	i.rowChan = make(chan Row, 512)
 
 	// Launch workers.
+	ctx.GetLogger().Debugf("ConcurrentTableRowIter: launching %d workers for table %s", workers, i.table.Name())
 	for w := 0; w < workers; w++ {
+		workerID := w
 		errguard.Go(eg, func() error {
+			workerCtx.GetLogger().Debugf("ConcurrentTableRowIter: worker %d started for table %s", workerID, i.table.Name())
 			for part := range workChan {
+				workerCtx.GetLogger().Debugf("ConcurrentTableRowIter: worker %d reading partition %v for table %s", workerID, part, i.table.Name())
 				rowIter, err := i.table.PartitionRows(workerCtx, part)
 				if err != nil {
+					workerCtx.GetLogger().Debugf("ConcurrentTableRowIter: worker %d error opening partition %v: %v", workerID, part, err)
 					return err
 				}
 				for {
@@ -279,6 +291,7 @@ func (i *ConcurrentTableRowIter) start(ctx *Context) error {
 						break
 					}
 					if err != nil {
+						workerCtx.GetLogger().Debugf("ConcurrentTableRowIter: worker %d error reading row from partition %v: %v", workerID, part, err)
 						_ = rowIter.Close(workerCtx)
 						return err
 					}
@@ -286,11 +299,13 @@ func (i *ConcurrentTableRowIter) start(ctx *Context) error {
 					select {
 					case i.rowChan <- row:
 					case <-cancelCtx.Done():
+						workerCtx.GetLogger().Debugf("ConcurrentTableRowIter: worker %d context cancelled for table %s", workerID, i.table.Name())
 						_ = rowIter.Close(workerCtx)
 						return cancelCtx.Err()
 					}
 				}
 			}
+			workerCtx.GetLogger().Debugf("ConcurrentTableRowIter: worker %d finished for table %s", workerID, i.table.Name())
 			return nil
 		})
 	}
@@ -314,15 +329,18 @@ func (i *ConcurrentTableRowIter) Next(ctx *Context) (Row, error) {
 
 	select {
 	case <-ctx.Done():
+		ctx.GetLogger().Debugf("ConcurrentTableRowIter: Next context done for table %s: %v", i.table.Name(), ctx.Err())
 		return nil, ctx.Err()
 	case row, ok := <-i.rowChan:
 		if !ok {
 			// Channel closed — either all rows consumed or an error occurred.
 			if i.eg != nil {
 				if err := i.eg.Wait(); err != nil {
+					ctx.GetLogger().Debugf("ConcurrentTableRowIter: workers returned error for table %s: %v", i.table.Name(), err)
 					return nil, err
 				}
 			}
+			ctx.GetLogger().Debugf("ConcurrentTableRowIter: all rows consumed for table %s", i.table.Name())
 			return nil, io.EOF
 		}
 		return row, nil
@@ -330,9 +348,11 @@ func (i *ConcurrentTableRowIter) Next(ctx *Context) (Row, error) {
 }
 
 func (i *ConcurrentTableRowIter) Close(ctx *Context) error {
+	ctx.GetLogger().Debugf("ConcurrentTableRowIter: closing for table %s", i.table.Name())
 	i.closeMu.Lock()
 	defer i.closeMu.Unlock()
 	if i.closed {
+		ctx.GetLogger().Debugf("ConcurrentTableRowIter: already closed for table %s", i.table.Name())
 		return nil
 	}
 	i.closed = true
@@ -352,9 +372,11 @@ func (i *ConcurrentTableRowIter) Close(ctx *Context) error {
 	if i.eg != nil {
 		// Ignore context.Canceled since we just cancelled it.
 		if err := i.eg.Wait(); err != nil && err != context.Canceled {
+			ctx.GetLogger().Debugf("ConcurrentTableRowIter: close error for table %s: %v", i.table.Name(), err)
 			return err
 		}
 	}
 
+	ctx.GetLogger().Debugf("ConcurrentTableRowIter: closed successfully for table %s", i.table.Name())
 	return nil
 }
