@@ -32,6 +32,8 @@ func pushFilters(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scope, s
 	span, ctx := ctx.Span("push_filters")
 	defer span.End()
 
+	a.Log("checking if filters can be pushed down in node of type %T", n)
+
 	if !canDoPushdown(n) {
 		return n, transform.SameTree, nil
 	}
@@ -74,10 +76,11 @@ func pushFilters(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scope, s
 	return transform.Node(n, func(node sql.Node) (sql.Node, transform.TreeIdentity, error) {
 		switch n := node.(type) {
 		case *plan.Filter:
-			switch n.Child.(type) {
+			switch child := n.Child.(type) {
 			case *plan.TableAlias, *plan.ResolvedTable, *plan.IndexedTableAccess, *plan.ValueDerivedTable:
-				// can't push any lower
-				return n, transform.SameTree, nil
+				// Check if the underlying table implements sql.FilteredTable
+				// If so, we can push filters directly into the table
+				return pushFiltersIntoTable(ctx, a, n, child)
 			default:
 			}
 			// Find all col exprs and group them by the table they mention so that we can keep track of which ones
@@ -105,6 +108,105 @@ func pushFilters(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scope, s
 			return n, transform.SameTree, nil
 		}
 	})
+}
+
+// applyFiltersToTable checks if the table implements sql.FilteredTable and applies
+// any filters it can handle directly. Returns the new table node (or original if unchanged),
+// the filters that were handled by the table, and any error.
+func applyFiltersToTable(ctx *sql.Context, a *Analyzer, tableNode sql.Node, filterExprs []sql.Expression) (sql.Node, []sql.Expression, error) {
+	// Extract the underlying table and ResolvedTable
+	var table sql.Table
+	var rt *plan.ResolvedTable
+
+	switch n := tableNode.(type) {
+	case *plan.ResolvedTable:
+		table = n.UnderlyingTable()
+		rt = n
+	case *plan.TableAlias:
+		if resolved, ok := n.Child.(*plan.ResolvedTable); ok {
+			table = resolved.UnderlyingTable()
+			rt = resolved
+		}
+	case *plan.IndexedTableAccess, *plan.ValueDerivedTable:
+		// IndexedTableAccess already has index-based filtering
+		// ValueDerivedTable doesn't support filter pushdown
+		return tableNode, nil, nil
+	}
+
+	// Check if the table implements sql.FilteredTable
+	ft, ok := table.(sql.FilteredTable)
+	if !ok || rt == nil || len(filterExprs) == 0 {
+		return tableNode, nil, nil
+	}
+
+	// Ask the table which filters it can handle
+	handledFilters := ft.HandledFilters(filterExprs)
+	if len(handledFilters) == 0 {
+		return tableNode, nil, nil
+	}
+
+	// Apply the handled filters to the table
+	newTable := ft.WithFilters(ctx, handledFilters)
+
+	// Create a new ResolvedTable with the filtered table
+	newRT, err := rt.WithTable(newTable)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Rebuild the table node structure
+	var resultNode sql.Node = newRT
+	switch n := tableNode.(type) {
+	case *plan.TableAlias:
+		resultNode, err = n.WithChildren(newRT)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	a.Log(
+		"table %q handled %d filters directly",
+		table.Name(),
+		len(handledFilters),
+	)
+
+	return resultNode, handledFilters, nil
+}
+
+// pushFiltersIntoTable attempts to push filter expressions directly into a table
+// that implements sql.FilteredTable. This allows the table to handle filtering
+// internally (e.g., via index lookups) rather than relying on a Filter node above.
+func pushFiltersIntoTable(ctx *sql.Context, a *Analyzer, f *plan.Filter, tableNode sql.Node) (sql.Node, transform.TreeIdentity, error) {
+	// Split the filter expression into individual predicates
+	filterExprs := expression.SplitConjunction(f.Expression)
+
+	// Try to apply filters to the table
+	newTableNode, handledFilters, err := applyFiltersToTable(ctx, a, tableNode, filterExprs)
+	if err != nil {
+		return nil, transform.SameTree, err
+	}
+
+	if len(handledFilters) == 0 {
+		// Table can't handle any filters, return unchanged
+		return f, transform.SameTree, nil
+	}
+
+	// Calculate remaining filters that weren't handled by the table
+	remainingFilters := subtractExprSet(filterExprs, handledFilters)
+
+	a.Log(
+		"pushed %d filters into table, %d filters remaining",
+		len(handledFilters),
+		len(remainingFilters),
+	)
+
+	if len(remainingFilters) == 0 {
+		// All filters were handled by the table, remove the Filter node
+		return newTableNode, transform.NewTree, nil
+	}
+
+	// Some filters remain, keep them in a Filter node above the table
+	return plan.NewFilter(expression.JoinAnd(remainingFilters...), newTableNode), transform.NewTree, nil
 }
 
 // pushdownSubqueryAliasFilters attempts to push conditions in filters down to
@@ -239,36 +341,50 @@ func pushdownFiltersToAboveTable(
 	}
 
 	// Move any remaining filters for the table directly above the table itself
-	var pushedDownFilterExpression sql.Expression
-	if tableFilters := filters.availableFiltersForTable(ctx, tableNode.Name()); len(tableFilters) > 0 {
-		filters.markFiltersHandled(tableFilters...)
-		for i, filter := range tableFilters {
-			// If a filter contains a reference to a projection alias, pushing the filter will move it below the
-			// Project node. We need to replace the reference with the underlying expression.
-			tableFilters[i], _, _ = transform.Expr(filter, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
-				if gt, ok := e.(*expression.GetField); ok {
-					if aliasedExpression, ok := filters.projectionExpressions[gt.Id()]; ok {
-						return aliasedExpression, transform.NewTree, nil
-					}
-				}
-				return e, transform.SameTree, nil
-			})
-		}
-		pushedDownFilterExpression = expression.JoinAnd(tableFilters...)
-
-		a.Log(
-			"pushed down filters %s above table %q, %d filters handled of %d",
-			tableFilters,
-			tableNode.Name(),
-			len(tableFilters),
-			len(tableFilters),
-		)
+	tableFilters := filters.availableFiltersForTable(ctx, tableNode.Name())
+	if len(tableFilters) == 0 {
+		return tableNode, transform.SameTree, nil
 	}
+
+	filters.markFiltersHandled(tableFilters...)
+	for i, filter := range tableFilters {
+		// If a filter contains a reference to a projection alias, pushing the filter will move it below the
+		// Project node. We need to replace the reference with the underlying expression.
+		tableFilters[i], _, _ = transform.Expr(filter, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+			if gt, ok := e.(*expression.GetField); ok {
+				if aliasedExpression, ok := filters.projectionExpressions[gt.Id()]; ok {
+					return aliasedExpression, transform.NewTree, nil
+				}
+			}
+			return e, transform.SameTree, nil
+		})
+	}
+
+	a.Log(
+		"pushed down filters %s above table %q, %d filters handled of %d",
+		tableFilters,
+		tableNode.Name(),
+		len(tableFilters),
+		len(tableFilters),
+	)
+
+	// Try to apply filters directly to the table if it implements sql.FilteredTable
+	resultNode, handledByTable, err := applyFiltersToTable(ctx, a, tableNode, tableFilters)
+	if err != nil {
+		return nil, transform.SameTree, err
+	}
+
+	// Calculate remaining filters that weren't handled by the table
+	remainingFilters := subtractExprSet(tableFilters, handledByTable)
 
 	switch tableNode.(type) {
 	case *plan.ResolvedTable, *plan.TableAlias, *plan.ValueDerivedTable:
-		if pushedDownFilterExpression != nil {
-			return plan.NewFilter(pushedDownFilterExpression, tableNode), transform.NewTree, nil
+		if len(remainingFilters) > 0 {
+			return plan.NewFilter(expression.JoinAnd(remainingFilters...), resultNode), transform.NewTree, nil
+		}
+
+		if resultNode != tableNode {
+			return resultNode, transform.NewTree, nil
 		}
 
 		return tableNode, transform.SameTree, nil

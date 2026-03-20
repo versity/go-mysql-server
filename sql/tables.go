@@ -32,6 +32,17 @@ type Table interface {
 	PartitionRows(*Context, Partition) (RowIter, error)
 }
 
+// ConcurrentTable is a table that supports concurrent partition scanning.
+// Implementations should return a positive NumWorkers only when it is safe
+// to interleave rows from different partitions (i.e., when the storage layer
+// does not guarantee or require a specific partition ordering).
+type ConcurrentTable interface {
+	Table
+	// NumWorkers returns the number of concurrent goroutines to use for
+	// scanning partitions. Returning 0 or 1 disables concurrent scanning.
+	NumWorkers() int
+}
+
 // DatabaseSchemaTable is a table that can return the database schema it belongs to. This interface must be implemented
 // for correct function of some DDL in databases that implement SchemaDatabase.
 type DatabaseSchemaTable interface {
@@ -119,6 +130,66 @@ type ProjectedTable interface {
 	// Projections returns the names of the column projections applied to this table, or nil if no projection is applied
 	// and all columns of the schema will be returned.
 	Projections() []string
+}
+
+// AggregationType represents the type of aggregation that can be pushed down to partitions.
+type AggregationType int
+
+const (
+	// AggregationTypeCount represents COUNT aggregation
+	AggregationTypeCount AggregationType = iota
+	// AggregationTypeSum represents SUM aggregation
+	AggregationTypeSum
+	// AggregationTypeMin represents MIN aggregation
+	AggregationTypeMin
+	// AggregationTypeMax represents MAX aggregation
+	AggregationTypeMax
+	// AggregationTypeAvg represents AVG aggregation (pushed as SUM+COUNT pair)
+	AggregationTypeAvg
+)
+
+// ColumnAggregation describes an aggregation to be computed for a column.
+type ColumnAggregation struct {
+	// Type is the type of aggregation (COUNT, SUM, MIN, MAX, AVG)
+	Type AggregationType
+	// ColumnIndex is the index of the column to aggregate (-1 for COUNT(*))
+	ColumnIndex int
+	// ColumnName is the name of the column being aggregated
+	ColumnName string
+}
+
+// GroupByColumn describes a column used in a GROUP BY clause for aggregation pushdown.
+type GroupByColumn struct {
+	// ColumnName is the name of the column to group by
+	ColumnName string
+	// ColumnIndex is the index of the column in the table schema
+	ColumnIndex int
+}
+
+// AggregableTable is a table that can compute aggregations (COUNT, SUM, MIN, MAX, AVG),
+// avoiding the need to return all rows for aggregation by the query engine.
+type AggregableTable interface {
+	Table
+	// CanAggregate returns true if all of the given aggregations can be computed
+	// without GROUP BY.
+	CanAggregate(ctx *Context, aggs []ColumnAggregation) bool
+	// WithAggregates returns a table configured to compute the given aggregations.
+	// The returned table's PartitionRows should return a single row
+	// per partition with the aggregated values.
+	WithAggregates(ctx *Context, aggs []ColumnAggregation) Table
+	// Aggregates returns the aggregations configured for this table, or nil if none.
+	Aggregates() []ColumnAggregation
+
+	// CanGroupedAggregate returns true if the given aggregations can be computed
+	// with the given GROUP BY columns pushed down to partition level.
+	CanGroupedAggregate(ctx *Context, aggs []ColumnAggregation, groupByCols []GroupByColumn) bool
+	// WithGroupedAggregates returns a table configured to compute grouped aggregations.
+	// The returned table's PartitionRows should return one row per group per partition,
+	// with the group-by column values followed by the aggregated values.
+	// For AggregationTypeAvg, the table should return two values (partialSum, partialCount).
+	WithGroupedAggregates(ctx *Context, aggs []ColumnAggregation, groupByCols []GroupByColumn) Table
+	// GroupByColumns returns the GROUP BY columns configured for this table, or nil.
+	GroupByColumns() []GroupByColumn
 }
 
 // IndexAddressable is a table that can be scanned through a primary index

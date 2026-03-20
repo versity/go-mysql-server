@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/dolthub/vitess/go/sqltypes"
 	errors "gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -54,6 +55,12 @@ type Table struct {
 	filters           []sql.Expression
 	ignoreSessionData bool
 	pkIndexesEnabled  bool
+
+	// aggregates is the list of aggregations to compute at the partition level
+	aggregates []sql.ColumnAggregation
+
+	// groupByCols is the list of GROUP BY columns for grouped aggregation pushdown
+	groupByCols []sql.GroupByColumn
 }
 
 var _ sql.Table = (*Table)(nil)
@@ -75,6 +82,7 @@ var _ sql.CheckTable = (*Table)(nil)
 var _ sql.AutoIncrementTable = (*Table)(nil)
 var _ sql.StatisticsTable = (*Table)(nil)
 var _ sql.ProjectedTable = (*Table)(nil)
+var _ sql.AggregableTable = (*Table)(nil)
 var _ sql.PrimaryKeyAlterableTable = (*Table)(nil)
 var _ sql.PrimaryKeyTable = (*Table)(nil)
 var _ fulltext.IndexAlterableTable = (*Table)(nil)
@@ -517,6 +525,16 @@ func (i *indexScanRowIter) Close(context *sql.Context) error {
 // PartitionRows implements the sql.PartitionRows interface.
 func (t *Table) PartitionRows(ctx *sql.Context, partition sql.Partition) (sql.RowIter, error) {
 	data := t.sessionTableData(ctx)
+
+	// If grouped aggregates are configured, compute them by group
+	if len(t.aggregates) > 0 && len(t.groupByCols) > 0 {
+		return t.computeGroupedAggregates(ctx, partition, data)
+	}
+
+	// If ungrouped aggregates are configured, compute them instead of returning rows
+	if len(t.aggregates) > 0 {
+		return t.computeAggregates(ctx, partition, data)
+	}
 
 	if isp, ok := partition.(indexScanPartition); ok {
 		numColumns := len(data.schema.Schema)
@@ -1788,6 +1806,460 @@ func (t *Table) WithProjections(cols []string) sql.Table {
 // Projections implements sql.ProjectedTable
 func (t *Table) Projections() []string {
 	return t.projection
+}
+
+// CanAggregate implements sql.AggregableTable
+func (t *Table) CanAggregate(ctx *sql.Context, aggs []sql.ColumnAggregation) bool {
+	// Memory table supports COUNT, SUM, MIN, MAX on any column
+	for _, agg := range aggs {
+		switch agg.Type {
+		case sql.AggregationTypeCount, sql.AggregationTypeSum, sql.AggregationTypeMin, sql.AggregationTypeMax:
+			// supported
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// WithAggregates implements sql.AggregableTable
+func (t *Table) WithAggregates(ctx *sql.Context, aggs []sql.ColumnAggregation) sql.Table {
+	nt := *t
+	nt.aggregates = aggs
+	return &nt
+}
+
+// Aggregates implements sql.AggregableTable
+func (t *Table) Aggregates() []sql.ColumnAggregation {
+	return t.aggregates
+}
+
+// CanGroupedAggregate implements sql.AggregableTable
+func (t *Table) CanGroupedAggregate(ctx *sql.Context, aggs []sql.ColumnAggregation, groupByCols []sql.GroupByColumn) bool {
+	for _, agg := range aggs {
+		switch agg.Type {
+		case sql.AggregationTypeCount, sql.AggregationTypeSum, sql.AggregationTypeMin, sql.AggregationTypeMax, sql.AggregationTypeAvg:
+			// supported
+		default:
+			return false
+		}
+	}
+	return len(groupByCols) > 0
+}
+
+// WithGroupedAggregates implements sql.AggregableTable
+func (t *Table) WithGroupedAggregates(ctx *sql.Context, aggs []sql.ColumnAggregation, groupByCols []sql.GroupByColumn) sql.Table {
+	nt := *t
+	nt.aggregates = aggs
+	nt.groupByCols = groupByCols
+	return &nt
+}
+
+// GroupByColumns implements sql.AggregableTable
+func (t *Table) GroupByColumns() []sql.GroupByColumn {
+	return t.groupByCols
+}
+
+// computeGroupedAggregates computes grouped aggregations for a single partition.
+// Returns multiple rows (one per group within this partition).
+// Row layout: [groupByCol1, ..., groupByColN, agg1, agg2, ...]
+// For AggregationTypeAvg, two values are returned: (partialSum, partialCount).
+func (t *Table) computeGroupedAggregates(ctx *sql.Context, partition sql.Partition, data *TableData) (sql.RowIter, error) {
+	rows, ok := data.partitions[string(partition.Key())]
+	if !ok {
+		return nil, sql.ErrPartitionNotFound.New(partition.Key())
+	}
+
+	// If partition is empty, return no rows
+	if len(rows) == 0 {
+		return sql.RowsToRowIter(), nil
+	}
+
+	// Resolve group-by column indices in the full schema
+	gbIndices := make([]int, len(t.groupByCols))
+	for i, gc := range t.groupByCols {
+		found := false
+		for j, col := range data.schema.Schema {
+			if col.Name == gc.ColumnName {
+				gbIndices[i] = j
+				found = true
+				break
+			}
+		}
+		if !found {
+			gbIndices[i] = gc.ColumnIndex
+		}
+	}
+
+	// Resolve aggregation column indices
+	aggColIndices := make([]int, len(t.aggregates))
+	for i, agg := range t.aggregates {
+		if agg.ColumnIndex < 0 {
+			aggColIndices[i] = -1 // COUNT(*)
+		} else if agg.ColumnName != "" {
+			found := false
+			for j, col := range data.schema.Schema {
+				if col.Name == agg.ColumnName {
+					aggColIndices[i] = j
+					found = true
+					break
+				}
+			}
+			if !found {
+				aggColIndices[i] = agg.ColumnIndex
+			}
+		} else {
+			aggColIndices[i] = agg.ColumnIndex
+		}
+	}
+
+	// Calculate the number of agg slots per output row
+	aggSlots := 0
+	for _, agg := range t.aggregates {
+		if agg.Type == sql.AggregationTypeAvg {
+			aggSlots += 2
+		} else {
+			aggSlots++
+		}
+	}
+
+	// Group rows by group-by column values
+	type groupData struct {
+		key     sql.Row       // group-by column values
+		aggVals []interface{} // aggregation accumulator slots
+	}
+	var groupOrder []string
+	groups := make(map[string]*groupData)
+
+	for _, row := range rows {
+		// Build group key
+		keyParts := make([]string, len(gbIndices))
+		keyVals := make(sql.Row, len(gbIndices))
+		for i, idx := range gbIndices {
+			if idx >= 0 && idx < len(row) {
+				keyVals[i] = row[idx]
+				keyParts[i] = fmt.Sprintf("%v", row[idx])
+			}
+		}
+		var keyStr string
+		if len(keyParts) == 1 {
+			keyStr = keyParts[0]
+		} else {
+			keyStr = strings.Join(keyParts, "\x00")
+		}
+
+		gd, exists := groups[keyStr]
+		if !exists {
+			vals := make([]interface{}, aggSlots)
+			slotIdx := 0
+			for _, agg := range t.aggregates {
+				switch agg.Type {
+				case sql.AggregationTypeCount:
+					vals[slotIdx] = int64(0)
+				case sql.AggregationTypeSum:
+					vals[slotIdx] = float64(0)
+				case sql.AggregationTypeAvg:
+					vals[slotIdx] = float64(0) // partial sum
+					vals[slotIdx+1] = int64(0) // partial count
+				case sql.AggregationTypeMin, sql.AggregationTypeMax:
+					vals[slotIdx] = nil
+				}
+				if agg.Type == sql.AggregationTypeAvg {
+					slotIdx += 2
+				} else {
+					slotIdx++
+				}
+			}
+			gd = &groupData{key: keyVals, aggVals: vals}
+			groups[keyStr] = gd
+			groupOrder = append(groupOrder, keyStr)
+		}
+
+		// Accumulate aggregation values
+		slotIdx := 0
+		for i, agg := range t.aggregates {
+			colIdx := aggColIndices[i]
+			switch agg.Type {
+			case sql.AggregationTypeCount:
+				if colIdx < 0 {
+					gd.aggVals[slotIdx] = gd.aggVals[slotIdx].(int64) + 1
+				} else if colIdx < len(row) && row[colIdx] != nil {
+					gd.aggVals[slotIdx] = gd.aggVals[slotIdx].(int64) + 1
+				}
+			case sql.AggregationTypeSum:
+				if colIdx >= 0 && colIdx < len(row) && row[colIdx] != nil {
+					if f, ok := t.toFloat64(row[colIdx]); ok {
+						gd.aggVals[slotIdx] = gd.aggVals[slotIdx].(float64) + f
+					}
+				}
+			case sql.AggregationTypeAvg:
+				if colIdx >= 0 && colIdx < len(row) && row[colIdx] != nil {
+					if f, ok := t.toFloat64(row[colIdx]); ok {
+						gd.aggVals[slotIdx] = gd.aggVals[slotIdx].(float64) + f
+						gd.aggVals[slotIdx+1] = gd.aggVals[slotIdx+1].(int64) + 1
+					}
+				}
+			case sql.AggregationTypeMin:
+				if colIdx >= 0 && colIdx < len(row) && row[colIdx] != nil {
+					if gd.aggVals[slotIdx] == nil {
+						gd.aggVals[slotIdx] = row[colIdx]
+					} else if t.compareValues(row[colIdx], gd.aggVals[slotIdx]) < 0 {
+						gd.aggVals[slotIdx] = row[colIdx]
+					}
+				}
+			case sql.AggregationTypeMax:
+				if colIdx >= 0 && colIdx < len(row) && row[colIdx] != nil {
+					if gd.aggVals[slotIdx] == nil {
+						gd.aggVals[slotIdx] = row[colIdx]
+					} else if t.compareValues(row[colIdx], gd.aggVals[slotIdx]) > 0 {
+						gd.aggVals[slotIdx] = row[colIdx]
+					}
+				}
+			}
+			if agg.Type == sql.AggregationTypeAvg {
+				slotIdx += 2
+			} else {
+				slotIdx++
+			}
+		}
+	}
+
+	// Build result rows
+	resultRows := make([]sql.Row, 0, len(groupOrder))
+	for _, key := range groupOrder {
+		gd := groups[key]
+		outRow := make(sql.Row, len(gbIndices)+aggSlots)
+		copy(outRow, gd.key)
+		copy(outRow[len(gbIndices):], gd.aggVals)
+		resultRows = append(resultRows, outRow)
+	}
+
+	return sql.RowsToRowIter(resultRows...), nil
+}
+
+// computeAggregates computes aggregations for a single partition
+// and returns a single-row iterator with the aggregated values.
+func (t *Table) computeAggregates(ctx *sql.Context, partition sql.Partition, data *TableData) (sql.RowIter, error) {
+	rows, ok := data.partitions[string(partition.Key())]
+	if !ok {
+		return nil, sql.ErrPartitionNotFound.New(partition.Key())
+	}
+
+	// Map column names to actual data indices (handling projection)
+	// The ColumnIndex from analyzer is based on projected schema, but
+	// partition data uses full schema indices.
+	colIndices := make([]int, len(t.aggregates))
+	for i, agg := range t.aggregates {
+		if agg.ColumnIndex < 0 {
+			// COUNT(*) - no column
+			colIndices[i] = -1
+		} else if agg.ColumnName != "" {
+			// Look up by column name in full schema
+			found := false
+			for j, col := range data.schema.Schema {
+				if col.Name == agg.ColumnName {
+					colIndices[i] = j
+					found = true
+					break
+				}
+			}
+			if !found {
+				// Fallback to passed index if name lookup fails
+				colIndices[i] = agg.ColumnIndex
+			}
+		} else {
+			colIndices[i] = agg.ColumnIndex
+		}
+	}
+
+	result := make(sql.Row, len(t.aggregates))
+
+	// Determine column types for SUM to preserve integer precision
+	sumIsInt := make([]bool, len(t.aggregates))
+	for i, agg := range t.aggregates {
+		if agg.Type == sql.AggregationTypeSum {
+			colIdx := colIndices[i]
+			if colIdx >= 0 && colIdx < len(data.schema.Schema) {
+				sumIsInt[i] = t.isIntegerType(data.schema.Schema[colIdx].Type)
+			}
+		}
+	}
+
+	// Initialize result values
+	for i, agg := range t.aggregates {
+		switch agg.Type {
+		case sql.AggregationTypeCount:
+			result[i] = int64(0)
+		case sql.AggregationTypeSum:
+			if sumIsInt[i] {
+				// Currently go-mysql-server uses float64 for integer sums
+				// TODO: use decimal when sum is fixed to return decimal
+				result[i] = float64(0)
+			} else {
+				result[i] = float64(0)
+			}
+		case sql.AggregationTypeMin, sql.AggregationTypeMax:
+			result[i] = nil
+		}
+	}
+
+	// Process each row
+	for _, row := range rows {
+		for i, agg := range t.aggregates {
+			colIdx := colIndices[i]
+			switch agg.Type {
+			case sql.AggregationTypeCount:
+				if colIdx < 0 {
+					// COUNT(*) - count all rows
+					result[i] = result[i].(int64) + 1
+				} else {
+					// COUNT(col) - count non-null values
+					if colIdx < len(row) && row[colIdx] != nil {
+						result[i] = result[i].(int64) + 1
+					}
+				}
+
+			case sql.AggregationTypeSum:
+				if colIdx >= 0 && colIdx < len(row) {
+					val := row[colIdx]
+					if val != nil {
+						// Currently go-mysql-server uses float64 for integer sums
+						// TODO: use decimal when sum is fixed to return decimal
+						if f, ok := t.toFloat64(val); ok {
+							result[i] = result[i].(float64) + f
+						}
+					}
+				}
+
+			case sql.AggregationTypeMin:
+				if colIdx >= 0 && colIdx < len(row) {
+					val := row[colIdx]
+					if val != nil {
+						if result[i] == nil {
+							result[i] = val
+						} else if t.compareValues(val, result[i]) < 0 {
+							result[i] = val
+						}
+					}
+				}
+
+			case sql.AggregationTypeMax:
+				if colIdx >= 0 && colIdx < len(row) {
+					val := row[colIdx]
+					if val != nil {
+						if result[i] == nil {
+							result[i] = val
+						} else if t.compareValues(val, result[i]) > 0 {
+							result[i] = val
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return sql.RowsToRowIter(result), nil
+}
+
+// isIntegerType checks if a SQL type is an integer type.
+func (t *Table) isIntegerType(sqlType sql.Type) bool {
+	_, _ = t.toInt64(0) // ensure toInt64 is compiled
+	switch sqlType.Type() {
+	case sqltypes.Int8, sqltypes.Int16, sqltypes.Int24, sqltypes.Int32, sqltypes.Int64,
+		sqltypes.Uint8, sqltypes.Uint16, sqltypes.Uint24, sqltypes.Uint32, sqltypes.Uint64:
+		return true
+	default:
+		return false
+	}
+}
+
+// toInt64 converts a value to int64 for integer SUM aggregation.
+func (t *Table) toInt64(val interface{}) (int64, bool) {
+	switch v := val.(type) {
+	case int:
+		return int64(v), true
+	case int8:
+		return int64(v), true
+	case int16:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case uint:
+		return int64(v), true
+	case uint8:
+		return int64(v), true
+	case uint16:
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+// toFloat64 converts a value to float64 for float SUM aggregation.
+func (t *Table) toFloat64(val interface{}) (float64, bool) {
+	switch v := val.(type) {
+	case int:
+		return float64(v), true
+	case int8:
+		return float64(v), true
+	case int16:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint:
+		return float64(v), true
+	case uint8:
+		return float64(v), true
+	case uint16:
+		return float64(v), true
+	case uint32:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+// compareValues compares two values for MIN/MAX aggregation.
+func (t *Table) compareValues(a, b interface{}) int {
+	// Try numeric comparison
+	if af, aok := t.toFloat64(a); aok {
+		if bf, bok := t.toFloat64(b); bok {
+			if af < bf {
+				return -1
+			} else if af > bf {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Try string comparison
+	if as, ok := a.(string); ok {
+		if bs, ok := b.(string); ok {
+			if as < bs {
+				return -1
+			} else if as > bs {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	return 0
 }
 
 func (t *Table) dbName() string {

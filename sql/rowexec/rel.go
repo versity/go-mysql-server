@@ -799,7 +799,11 @@ func (b *BaseBuilder) buildIndexedTableAccess(ctx *sql.Context, n *plan.IndexedT
 	}
 
 	var tableIter sql.RowIter
-	tableIter = sql.NewTableRowIter(ctx, n.Table, partIter)
+	if ct, ok := sql.GetUnderlyingTable(n.Table).(sql.ConcurrentTable); ok && ct.NumWorkers() > 1 {
+		tableIter = sql.NewConcurrentTableRowIter(ctx, n.Table, partIter, ct.NumWorkers())
+	} else {
+		tableIter = sql.NewTableRowIter(ctx, n.Table, partIter)
+	}
 
 	if vct, ok := plan.FindVirtualColumnTable(n.Table); ok {
 		tableIter, err = b.buildVirtualColumnTable(ctx, vct, tableIter, row)
@@ -932,7 +936,11 @@ func (b *BaseBuilder) buildResolvedTable(ctx *sql.Context, n *plan.ResolvedTable
 	}
 
 	var iter sql.RowIter
-	iter = sql.NewTableRowIter(ctx, n.Table, partitions)
+	if ct, ok := sql.GetUnderlyingTable(n.Table).(sql.ConcurrentTable); ok && ct.NumWorkers() > 1 {
+		iter = sql.NewConcurrentTableRowIter(ctx, n.Table, partitions, ct.NumWorkers())
+	} else {
+		iter = sql.NewTableRowIter(ctx, n.Table, partitions)
+	}
 
 	if vct, ok := plan.FindVirtualColumnTable(n.Table); ok {
 		iter, err = b.buildVirtualColumnTable(ctx, vct, iter, row)

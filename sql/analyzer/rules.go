@@ -86,6 +86,7 @@ var OnceAfterDefault = []Rule{
 	{Id: finalizeSubqueriesId, Apply: finalizeSubqueries},
 	{Id: applyIndexesFromOuterScopeId, Apply: applyIndexesFromOuterScope},
 	{Id: replaceAggId, Apply: replaceAgg},
+	{Id: pushdownAggregationsId, Apply: pushdownAggregations},
 	{Id: replaceIdxSortId, Apply: replaceIdxSort},
 	{Id: eraseProjectionId, Apply: eraseProjection},
 	{Id: flattenDistinctId, Apply: flattenDistinct},

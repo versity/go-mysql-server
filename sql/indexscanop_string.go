@@ -30,8 +30,9 @@ const _IndexScanOp_name = "=<=>=!=!=>>=<<=&&||IS NULLIS NOT NULLSpatialEqFulltex
 var _IndexScanOp_index = [...]uint8{0, 1, 4, 5, 7, 9, 10, 12, 13, 15, 17, 19, 26, 37, 46, 56}
 
 func (i IndexScanOp) String() string {
-	if i >= IndexScanOp(len(_IndexScanOp_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_IndexScanOp_index)-1 {
 		return "IndexScanOp(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _IndexScanOp_name[_IndexScanOp_index[i]:_IndexScanOp_index[i+1]]
+	return _IndexScanOp_name[_IndexScanOp_index[idx]:_IndexScanOp_index[idx+1]]
 }

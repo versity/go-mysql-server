@@ -276,9 +276,8 @@ offset 1;`,
 		Query: `select count(pk1) from two_pk`,
 		ExpectedPlan: "Project\n" +
 			" ├─ columns: [count(two_pk.pk1):0!null->count(pk1):0]\n" +
-			" └─ GroupBy\n" +
-			"     ├─ select: COUNT(two_pk.pk1:0!null)\n" +
-			"     ├─ group: \n" +
+			" └─ PartitionAggregation\n" +
+			"     ├─ Aggregations(COUNT(col[0]:pk1) AS COUNT(two_pk.pk1))\n" +
 			"     └─ ProcessTable\n" +
 			"         └─ Table\n" +
 			"             ├─ name: two_pk\n" +
@@ -286,18 +285,16 @@ offset 1;`,
 			"",
 		ExpectedEstimates: "Project\n" +
 			" ├─ columns: [count(two_pk.pk1) as count(pk1)]\n" +
-			" └─ GroupBy\n" +
-			"     ├─ select: COUNT(two_pk.pk1)\n" +
-			"     ├─ group: \n" +
+			" └─ PartitionAggregation\n" +
+			"     ├─ Aggregations(COUNT(pk1) AS COUNT(two_pk.pk1))\n" +
 			"     └─ Table\n" +
 			"         ├─ name: two_pk\n" +
 			"         └─ columns: [pk1]\n" +
 			"",
 		ExpectedAnalysis: "Project\n" +
 			" ├─ columns: [count(two_pk.pk1) as count(pk1)]\n" +
-			" └─ GroupBy\n" +
-			"     ├─ select: COUNT(two_pk.pk1)\n" +
-			"     ├─ group: \n" +
+			" └─ PartitionAggregation\n" +
+			"     ├─ Aggregations(COUNT(pk1) AS COUNT(two_pk.pk1))\n" +
 			"     └─ Table\n" +
 			"         ├─ name: two_pk\n" +
 			"         └─ columns: [pk1]\n" +

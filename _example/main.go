@@ -91,18 +91,19 @@ func createTestDatabase() *memory.DbProvider {
 	ctx.Session = session
 
 	table := memory.NewTable(db, tableName, sql.NewPrimaryKeySchema(sql.Schema{
-		{Name: "name", Type: types.Text, Nullable: false, Source: tableName, PrimaryKey: true},
-		{Name: "email", Type: types.Text, Nullable: false, Source: tableName, PrimaryKey: true},
+		{Name: "id", Type: types.Int32, Nullable: false, Source: tableName, PrimaryKey: true},
+		{Name: "name", Type: types.Text, Nullable: false, Source: tableName},
+		{Name: "email", Type: types.Text, Nullable: false, Source: tableName},
 		{Name: "phone_numbers", Type: types.JSON, Nullable: false, Source: tableName},
 		{Name: "created_at", Type: types.MustCreateDatetimeType(query.Type_DATETIME, 6), Nullable: false, Source: tableName},
 	}), db.GetForeignKeyCollection())
 	db.AddTable(tableName, table)
 
 	creationTime := time.Unix(0, 1667304000000001000).UTC()
-	_ = table.Insert(ctx, sql.NewRow("Jane Deo", "janedeo@gmail.com", types.MustJSON(`["556-565-566", "777-777-777"]`), creationTime))
-	_ = table.Insert(ctx, sql.NewRow("Jane Doe", "jane@doe.com", types.MustJSON(`[]`), creationTime))
-	_ = table.Insert(ctx, sql.NewRow("John Doe", "john@doe.com", types.MustJSON(`["555-555-555"]`), creationTime))
-	_ = table.Insert(ctx, sql.NewRow("John Doe", "johnalt@doe.com", types.MustJSON(`[]`), creationTime))
+	_ = table.Insert(ctx, sql.NewRow(int32(1), "Jane Deo", "janedeo@gmail.com", types.MustJSON(`["556-565-566", "777-777-777"]`), creationTime))
+	_ = table.Insert(ctx, sql.NewRow(int32(2), "Jane Doe", "jane@doe.com", types.MustJSON(`[]`), creationTime))
+	_ = table.Insert(ctx, sql.NewRow(int32(3), "John Doe", "john@doe.com", types.MustJSON(`["555-555-555"]`), creationTime))
+	_ = table.Insert(ctx, sql.NewRow(int32(4), "John Doe", "johnalt@doe.com", types.MustJSON(`[]`), creationTime))
 
 	return pro
 }

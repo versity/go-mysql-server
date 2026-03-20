@@ -16,12 +16,15 @@ package rowexec
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 
 	"github.com/dolthub/go-mysql-server/errguard"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression/function/aggregation"
 	"github.com/dolthub/go-mysql-server/sql/hash"
+	"github.com/dolthub/go-mysql-server/sql/plan"
 )
 
 type groupByIter struct {
@@ -326,4 +329,488 @@ func evalBuffers(
 	}
 
 	return row, nil
+}
+
+// buildPartitionAggregation builds the row iterator for PartitionAggregation nodes.
+// It reads pre-aggregated results from each partition and merges them.
+func (b *BaseBuilder) buildPartitionAggregation(ctx *sql.Context, n *plan.PartitionAggregation, row sql.Row) (sql.RowIter, error) {
+	span, ctx := ctx.Span("plan.PartitionAggregation")
+	defer span.End()
+
+	childIter, err := b.buildNodeExec(ctx, n.Child, row)
+	if err != nil {
+		return nil, err
+	}
+
+	return &partitionAggregationIter{
+		child: childIter,
+		aggs:  n.Aggregations,
+	}, nil
+}
+
+// partitionAggregationIter merges partition-level aggregation results.
+type partitionAggregationIter struct {
+	child sql.RowIter
+	aggs  []sql.ColumnAggregation
+	done  bool
+}
+
+func (i *partitionAggregationIter) Next(ctx *sql.Context) (sql.Row, error) {
+	if i.done {
+		return nil, io.EOF
+	}
+	i.done = true
+
+	// Initialize merged results - SUM will be initialized on first value to preserve type
+	merged := make([]interface{}, len(i.aggs))
+	for j, agg := range i.aggs {
+		switch agg.Type {
+		case sql.AggregationTypeCount:
+			merged[j] = int64(0)
+		case sql.AggregationTypeSum:
+			// Leave nil - will be initialized with correct type on first value
+			merged[j] = nil
+		case sql.AggregationTypeMin, sql.AggregationTypeMax:
+			merged[j] = nil
+		}
+	}
+
+	// Read all partition results and merge
+	for {
+		row, err := i.child.Next(ctx)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+
+		// Merge each aggregation value
+		for j, agg := range i.aggs {
+			if j >= len(row) {
+				continue
+			}
+
+			val := row[j]
+			if val == nil {
+				continue
+			}
+
+			switch agg.Type {
+			case sql.AggregationTypeCount:
+				// Sum up counts
+				if count, ok := aggToInt64(val); ok {
+					merged[j] = merged[j].(int64) + count
+				}
+
+			case sql.AggregationTypeSum:
+				// Sum up sums - preserve int64 or float64 based on partition value type
+				if merged[j] == nil {
+					// First value - initialize with same type
+					switch v := val.(type) {
+					case int64:
+						merged[j] = v
+					case float64:
+						merged[j] = v
+					default:
+						// Fallback to float64 for other numeric types
+						if f, ok := aggToFloat64(val); ok {
+							merged[j] = f
+						}
+					}
+				} else {
+					// Subsequent values - accumulate with matching type
+					switch current := merged[j].(type) {
+					case int64:
+						if v, ok := aggToInt64(val); ok {
+							merged[j] = current + v
+						}
+					case float64:
+						if f, ok := aggToFloat64(val); ok {
+							merged[j] = current + f
+						}
+					}
+				}
+
+			case sql.AggregationTypeMin:
+				// Take minimum
+				if merged[j] == nil {
+					merged[j] = val
+				} else if aggCompareValues(val, merged[j]) < 0 {
+					merged[j] = val
+				}
+
+			case sql.AggregationTypeMax:
+				// Take maximum
+				if merged[j] == nil {
+					merged[j] = val
+				} else if aggCompareValues(val, merged[j]) > 0 {
+					merged[j] = val
+				}
+			}
+		}
+	}
+
+	return sql.Row(merged), nil
+}
+
+func (i *partitionAggregationIter) Close(ctx *sql.Context) error {
+	return i.child.Close(ctx)
+}
+
+// aggToInt64 converts a value to int64 if possible.
+func aggToInt64(val interface{}) (int64, bool) {
+	switch v := val.(type) {
+	case int:
+		return int64(v), true
+	case int8:
+		return int64(v), true
+	case int16:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case uint:
+		return int64(v), true
+	case uint8:
+		return int64(v), true
+	case uint16:
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint64:
+		return int64(v), true
+	case float32:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+// aggToFloat64 converts a value to float64 if possible.
+func aggToFloat64(val interface{}) (float64, bool) {
+	switch v := val.(type) {
+	case int:
+		return float64(v), true
+	case int8:
+		return float64(v), true
+	case int16:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint:
+		return float64(v), true
+	case uint8:
+		return float64(v), true
+	case uint16:
+		return float64(v), true
+	case uint32:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+// aggCompareValues compares two values, returning -1, 0, or 1.
+func aggCompareValues(a, b interface{}) int {
+	// Handle numeric comparisons
+	if af, aok := aggToFloat64(a); aok {
+		if bf, bok := aggToFloat64(b); bok {
+			if af < bf {
+				return -1
+			} else if af > bf {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Handle string comparisons
+	if as, ok := a.(string); ok {
+		if bs, ok := b.(string); ok {
+			if as < bs {
+				return -1
+			} else if as > bs {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Fallback: treat as equal if we can't compare
+	return 0
+}
+
+// buildPartitionGroupedAggregation builds the row iterator for PartitionGroupedAggregation nodes.
+// It reads pre-aggregated grouped results from each partition and merges them by group key.
+func (b *BaseBuilder) buildPartitionGroupedAggregation(ctx *sql.Context, n *plan.PartitionGroupedAggregation, row sql.Row) (sql.RowIter, error) {
+	span, ctx := ctx.Span("plan.PartitionGroupedAggregation")
+	defer span.End()
+
+	childIter, err := b.buildNodeExec(ctx, n.Child, row)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: creating with %d aggregations and %d group-by columns", len(n.Aggregations), len(n.GroupByCols))
+	return &partitionGroupedAggregationIter{
+		child:       childIter,
+		aggs:        n.Aggregations,
+		groupByCols: n.GroupByCols,
+		numGroupBy:  len(n.GroupByCols),
+	}, nil
+}
+
+// partitionGroupedAggregationIter merges partition-level grouped aggregation results.
+// Each partition returns rows of: [groupByCol1, ..., groupByColN, agg1, agg2, ...]
+// where AVG aggregations occupy two columns (partialSum, partialCount).
+type partitionGroupedAggregationIter struct {
+	child       sql.RowIter
+	aggs        []sql.ColumnAggregation
+	groupByCols []sql.GroupByColumn
+	numGroupBy  int
+	computed    bool
+	results     []sql.Row
+	pos         int
+}
+
+// groupKeyString builds a string key from the group-by column values of a partition row.
+func (i *partitionGroupedAggregationIter) groupKeyString(row sql.Row) string {
+	if i.numGroupBy == 1 {
+		return fmt.Sprintf("%v", row[0])
+	}
+	parts := make([]string, i.numGroupBy)
+	for k := 0; k < i.numGroupBy; k++ {
+		parts[k] = fmt.Sprintf("%v", row[k])
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func (i *partitionGroupedAggregationIter) Next(ctx *sql.Context) (sql.Row, error) {
+	if !i.computed {
+		ctx.GetLogger().Debugf("partitionGroupedAggregationIter: first call to Next, computing all groups")
+		if err := i.computeAll(ctx); err != nil {
+			ctx.GetLogger().Debugf("partitionGroupedAggregationIter: computeAll error: %v", err)
+			return nil, err
+		}
+		i.computed = true
+		ctx.GetLogger().Debugf("partitionGroupedAggregationIter: computed %d result groups", len(i.results))
+	}
+
+	if i.pos >= len(i.results) {
+		ctx.GetLogger().Debugf("partitionGroupedAggregationIter: all %d results returned, EOF", len(i.results))
+		return nil, io.EOF
+	}
+	row := i.results[i.pos]
+	i.pos++
+	return row, nil
+}
+
+// aggSlotCount returns the number of slots an aggregation occupies in the partition row.
+// AVG takes 2 slots (partialSum, partialCount); everything else takes 1.
+func aggSlotCount(agg sql.ColumnAggregation) int {
+	if agg.Type == sql.AggregationTypeAvg {
+		return 2
+	}
+	return 1
+}
+
+// computeAll reads all partition rows and merges by group key.
+func (i *partitionGroupedAggregationIter) computeAll(ctx *sql.Context) error {
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: computeAll starting with %d aggregations", len(i.aggs))
+	// Calculate expected number of agg slots per partition row
+	aggSlots := 0
+	for _, agg := range i.aggs {
+		aggSlots += aggSlotCount(agg)
+	}
+
+	// Ordered list of group keys to preserve insertion order
+	var groupOrder []string
+
+	// Map from group key → merged agg values (same layout as partition agg slots)
+	type mergedGroup struct {
+		groupKey sql.Row
+		aggVals  []interface{}
+	}
+	groups := make(map[string]*mergedGroup)
+
+	rowCount := 0
+	newGroupCount := 0
+	for {
+		row, err := i.child.Next(ctx)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			ctx.GetLogger().Debugf("partitionGroupedAggregationIter: error reading child row: %v", err)
+			return err
+		}
+		rowCount++
+
+		key := i.groupKeyString(row)
+
+		mg, exists := groups[key]
+		if !exists {
+			newGroupCount++
+			// Initialize new group
+			groupKeyCopy := make(sql.Row, i.numGroupBy)
+			copy(groupKeyCopy, row[:i.numGroupBy])
+
+			vals := make([]interface{}, aggSlots)
+			slotIdx := 0
+			for _, agg := range i.aggs {
+				switch agg.Type {
+				case sql.AggregationTypeCount:
+					vals[slotIdx] = int64(0)
+				case sql.AggregationTypeSum:
+					vals[slotIdx] = nil
+				case sql.AggregationTypeAvg:
+					vals[slotIdx] = float64(0) // partial sum
+					vals[slotIdx+1] = int64(0) // partial count
+				case sql.AggregationTypeMin, sql.AggregationTypeMax:
+					vals[slotIdx] = nil
+				}
+				slotIdx += aggSlotCount(agg)
+			}
+
+			mg = &mergedGroup{groupKey: groupKeyCopy, aggVals: vals}
+			groups[key] = mg
+			groupOrder = append(groupOrder, key)
+		}
+
+		// Merge aggregation values from this partition row
+		partSlotIdx := i.numGroupBy // start after group-by columns in the row
+		mergeSlotIdx := 0
+		for _, agg := range i.aggs {
+			switch agg.Type {
+			case sql.AggregationTypeCount:
+				val := row[partSlotIdx]
+				if val != nil {
+					if count, ok := aggToInt64(val); ok {
+						mg.aggVals[mergeSlotIdx] = mg.aggVals[mergeSlotIdx].(int64) + count
+					}
+				}
+
+			case sql.AggregationTypeSum:
+				val := row[partSlotIdx]
+				if val != nil {
+					if mg.aggVals[mergeSlotIdx] == nil {
+						switch v := val.(type) {
+						case int64:
+							mg.aggVals[mergeSlotIdx] = v
+						case float64:
+							mg.aggVals[mergeSlotIdx] = v
+						default:
+							if f, ok := aggToFloat64(val); ok {
+								mg.aggVals[mergeSlotIdx] = f
+							}
+						}
+					} else {
+						switch current := mg.aggVals[mergeSlotIdx].(type) {
+						case int64:
+							if v, ok := aggToInt64(val); ok {
+								mg.aggVals[mergeSlotIdx] = current + v
+							}
+						case float64:
+							if f, ok := aggToFloat64(val); ok {
+								mg.aggVals[mergeSlotIdx] = current + f
+							}
+						default:
+							if curf, ok := current.(float64); ok {
+								if f, ok := aggToFloat64(val); ok {
+									mg.aggVals[mergeSlotIdx] = curf + f
+								}
+							}
+						}
+					}
+				}
+
+			case sql.AggregationTypeAvg:
+				// Partition returns (partialSum, partialCount) in two slots
+				partialSum := row[partSlotIdx]
+				partialCount := row[partSlotIdx+1]
+				if partialSum != nil && partialCount != nil {
+					if ps, ok := aggToFloat64(partialSum); ok {
+						mg.aggVals[mergeSlotIdx] = mg.aggVals[mergeSlotIdx].(float64) + ps
+					}
+					if pc, ok := aggToInt64(partialCount); ok {
+						mg.aggVals[mergeSlotIdx+1] = mg.aggVals[mergeSlotIdx+1].(int64) + pc
+					}
+				}
+
+			case sql.AggregationTypeMin:
+				val := row[partSlotIdx]
+				if val != nil {
+					if mg.aggVals[mergeSlotIdx] == nil {
+						mg.aggVals[mergeSlotIdx] = val
+					} else if aggCompareValues(val, mg.aggVals[mergeSlotIdx]) < 0 {
+						mg.aggVals[mergeSlotIdx] = val
+					}
+				}
+
+			case sql.AggregationTypeMax:
+				val := row[partSlotIdx]
+				if val != nil {
+					if mg.aggVals[mergeSlotIdx] == nil {
+						mg.aggVals[mergeSlotIdx] = val
+					} else if aggCompareValues(val, mg.aggVals[mergeSlotIdx]) > 0 {
+						mg.aggVals[mergeSlotIdx] = val
+					}
+				}
+			}
+
+			partSlotIdx += aggSlotCount(agg)
+			mergeSlotIdx += aggSlotCount(agg)
+		}
+	}
+
+	// Build result rows: [groupByCol1, ..., groupByColN, finalAgg1, finalAgg2, ...]
+	// For AVG, compute finalSum / finalCount as a single output value.
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: read %d partition rows into %d groups", rowCount, len(groupOrder))
+
+	i.results = make([]sql.Row, 0, len(groupOrder))
+	for _, key := range groupOrder {
+		mg := groups[key]
+		// Output row: group-by columns + one value per aggregation
+		outRow := make(sql.Row, i.numGroupBy+len(i.aggs))
+		copy(outRow, mg.groupKey)
+
+		mergeSlotIdx := 0
+		for aggIdx, agg := range i.aggs {
+			outIdx := i.numGroupBy + aggIdx
+			switch agg.Type {
+			case sql.AggregationTypeAvg:
+				sum := mg.aggVals[mergeSlotIdx].(float64)
+				count := mg.aggVals[mergeSlotIdx+1].(int64)
+				if count > 0 {
+					outRow[outIdx] = sum / float64(count)
+				} else {
+					outRow[outIdx] = nil
+				}
+			default:
+				outRow[outIdx] = mg.aggVals[mergeSlotIdx]
+			}
+			mergeSlotIdx += aggSlotCount(agg)
+		}
+		i.results = append(i.results, outRow)
+	}
+
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: computeAll finished with %d result rows", len(i.results))
+	return nil
+}
+
+func (i *partitionGroupedAggregationIter) Close(ctx *sql.Context) error {
+	ctx.GetLogger().Debugf("partitionGroupedAggregationIter: closing (computed=%t, returned %d/%d rows)", i.computed, i.pos, len(i.results))
+	return i.child.Close(ctx)
 }
